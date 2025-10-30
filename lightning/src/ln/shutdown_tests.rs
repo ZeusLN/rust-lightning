@@ -130,26 +130,14 @@ fn do_test_closing_signed_with_pending_peer_fee(signer_pending: bool) {
 	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 	check_added_monitors(&nodes[1], 0);
 
-	if signer_pending {
-		// The channel can't be failed when the signer unblocks, so it is left hung for the user
-		// to force-close.
+	let err = if signer_pending {
 		nodes[1].enable_channel_signer_op(&funder_id, &chan_id, SignerOp::SignClosingTransaction);
 		nodes[1].node.signer_unblocked(Some((funder_id, chan_id)));
-		nodes[1].logger.assert_log_contains(
-			"lightning::ln::channel",
-			"sent bogus closing signature",
-			1,
-		);
-		assert_eq!(nodes[1].node.list_channels().len(), 1);
-		assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
-		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
-		assert!(nodes[1].tx_broadcaster.txn_broadcast().is_empty());
-		check_added_monitors(&nodes[1], 0);
-		return;
-	}
-
-	nodes[1].node.handle_closing_signed(funder_id, &closing);
-	let err = "Remote end sent us a closing_signed while there was still a pending fee update";
+		"Cannot retry closing_signed while there is still a pending fee update"
+	} else {
+		nodes[1].node.handle_closing_signed(funder_id, &closing);
+		"Remote end sent us a closing_signed while there was still a pending fee update"
+	};
 	assert!(nodes[1].node.list_channels().is_empty());
 	check_added_monitors(&nodes[1], 1);
 	let errors = check_closed_broadcast(&nodes[1], 1, true);
