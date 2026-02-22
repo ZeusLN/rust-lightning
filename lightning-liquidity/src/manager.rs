@@ -32,6 +32,9 @@ use crate::lsps1::msgs::LSPS1Message;
 #[cfg(lsps1_service)]
 use crate::lsps1::service::{LSPS1ServiceConfig, LSPS1ServiceHandler};
 
+use crate::lsps7::client::{LSPS7ClientConfig, LSPS7ClientHandler};
+use crate::lsps7::msgs::LSPS7Message;
+
 use crate::lsps2::client::{LSPS2ClientConfig, LSPS2ClientHandler};
 use crate::lsps2::msgs::LSPS2Message;
 use crate::lsps2::service::{LSPS2ServiceConfig, LSPS2ServiceHandler, LSPS2ServiceHandlerSync};
@@ -96,6 +99,8 @@ pub struct LiquidityClientConfig {
 	pub lsps2_client_config: Option<LSPS2ClientConfig>,
 	/// Optional client-side configuration for LSPS5 webhook service.
 	pub lsps5_client_config: Option<LSPS5ClientConfig>,
+	/// Optional client-side configuration for LSPS7 channel lease extensions.
+	pub lsps7_client_config: Option<LSPS7ClientConfig>,
 }
 
 /// A trivial trait which describes any [`LiquidityManager`].
@@ -303,6 +308,7 @@ pub struct LiquidityManager<
 	lsps2_client_handler: Option<LSPS2ClientHandler<ES, K>>,
 	lsps5_service_handler: Option<LSPS5ServiceHandler<CM, NS, K, TP>>,
 	lsps5_client_handler: Option<LSPS5ClientHandler<ES, K>>,
+	lsps7_client_handler: Option<LSPS7ClientHandler<ES, K>>,
 	service_config: Option<LiquidityServiceConfig>,
 	_client_config: Option<LiquidityClientConfig>,
 	best_block: RwLock<Option<BestBlock>>,
@@ -471,6 +477,17 @@ where
 			})
 		});
 
+		let lsps7_client_handler = client_config.as_ref().and_then(|config| {
+			config.lsps7_client_config.as_ref().map(|config| {
+				LSPS7ClientHandler::new(
+					entropy_source.clone(),
+					Arc::clone(&pending_messages),
+					Arc::clone(&pending_events),
+					config.clone(),
+				)
+			})
+		});
+
 		#[cfg(lsps1_service)]
 		let lsps1_service_handler = service_config.as_ref().and_then(|config| {
 			if let Some(number) =
@@ -516,6 +533,7 @@ where
 			lsps2_service_handler,
 			lsps5_client_handler,
 			lsps5_service_handler,
+			lsps7_client_handler,
 			service_config,
 			_client_config: client_config,
 			best_block: RwLock::new(chain_params.map(|chain_params| chain_params.best_block)),
@@ -576,6 +594,14 @@ where
 	/// The returned handler allows to initiate the LSPS5 service-side flow.
 	pub fn lsps5_service_handler(&self) -> Option<&LSPS5ServiceHandler<CM, NS, K, TP>> {
 		self.lsps5_service_handler.as_ref()
+	}
+
+	/// Returns a reference to the LSPS7 client-side handler.
+	///
+	/// The returned handler allows to initiate the LSPS7 client-side flow, i.e., allows to
+	/// extend channel leases with the configured LSP.
+	pub fn lsps7_client_handler(&self) -> Option<&LSPS7ClientHandler<ES, K>> {
+		self.lsps7_client_handler.as_ref()
 	}
 
 	/// Returns a [`Future`] that will complete when the next batch of pending messages is ready to
@@ -763,6 +789,19 @@ where
 						return Err(LightningError { err: format!("Received LSPS5 request message without LSPS5 service handler configured. From node {}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Debug)});
 					},
 				}
+			},
+			LSPSMessage::LSPS7(msg @ LSPS7Message::Response(..)) => {
+				match &self.lsps7_client_handler {
+					Some(lsps7_client_handler) => {
+						lsps7_client_handler.handle_message(msg, sender_node_id)?;
+					},
+					None => {
+						return Err(LightningError { err: format!("Received LSPS7 response message without LSPS7 client handler configured. From node {}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Debug)});
+					},
+				}
+			},
+			LSPSMessage::LSPS7(_msg @ LSPS7Message::Request(..)) => {
+				return Err(LightningError { err: format!("Received LSPS7 request message without LSPS7 service handler configured. From node {}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Debug)});
 			},
 		}
 		Ok(())
@@ -1182,6 +1221,15 @@ where
 		&self,
 	) -> Option<&LSPS5ServiceHandler<CM, NS, KVStoreSyncWrapper<KS>, TP>> {
 		self.inner.lsps5_service_handler()
+	}
+
+	/// Returns a reference to the LSPS7 client-side handler.
+	///
+	/// Wraps [`LiquidityManager::lsps7_client_handler`].
+	pub fn lsps7_client_handler(
+		&self,
+	) -> Option<&LSPS7ClientHandler<ES, KVStoreSyncWrapper<KS>>> {
+		self.inner.lsps7_client_handler()
 	}
 
 	/// Returns a [`Future`] that will complete when the next batch of pending messages is ready to
