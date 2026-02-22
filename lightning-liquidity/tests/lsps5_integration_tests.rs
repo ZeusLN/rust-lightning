@@ -64,6 +64,7 @@ pub(crate) fn lsps5_test_setup_with_kv_stores<'a, 'b, 'c>(
 		lsps1_client_config: None,
 		lsps2_client_config: None,
 		lsps5_client_config: Some(lsps5_client_config),
+		lsps7_client_config: None,
 	};
 
 	let lsps_nodes = create_service_and_client_nodes_with_kv_stores(
@@ -249,6 +250,7 @@ pub(crate) fn lsps5_lsps2_test_setup<'a, 'b, 'c>(
 		lsps1_client_config: None,
 		lsps2_client_config: Some(lsps2_client_config),
 		lsps5_client_config: Some(lsps5_client_config),
+		lsps7_client_config: None,
 	};
 
 	let lsps_nodes = create_service_and_client_nodes(
@@ -1776,6 +1778,7 @@ fn lsps5_service_persist_resets_in_flight_counter_on_io_error() {
 		lsps1_client_config: None,
 		lsps2_client_config: None,
 		lsps5_client_config: Some(LSPS5ClientConfig::default()),
+		lsps7_client_config: None,
 	};
 	let time_provider: Arc<dyn TimeProvider + Send + Sync> = Arc::new(DefaultTimeProvider);
 
