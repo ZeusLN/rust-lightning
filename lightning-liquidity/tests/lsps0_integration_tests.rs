@@ -55,6 +55,7 @@ fn list_protocols_integration_test() {
 		lsps1_client_config: None,
 		lsps2_client_config: Some(lsps2_client_config),
 		lsps5_client_config: Some(lsps5_client_config),
+		lsps7_client_config: None,
 	};
 
 	let service_node_id = nodes[0].node.get_our_node_id();
