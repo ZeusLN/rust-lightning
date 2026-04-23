@@ -11824,6 +11824,17 @@ where
 		&mut self, node_signer: &NS, chain_hash: ChainHash, best_block_height: u32,
 		msg: &msgs::AnnouncementSignatures, user_config: &UserConfig
 	) -> Result<msgs::ChannelAnnouncement, ChannelError> where NS::Target: NodeSigner {
+		// Ignore sigs signed over a `short_channel_id` other than our current one (e.g. stale
+		// pre-splice sigs arriving after our side has promoted). Verifying them against the
+		// current `UnsignedChannelAnnouncement` would always fail the hash check, but per BOLT #7
+		// that's not a protocol violation warranting a force-close.
+		if Some(msg.short_channel_id) != self.funding.get_short_channel_id() {
+			return Err(ChannelError::Ignore(format!(
+				"Ignoring announcement_signatures for short_channel_id {} which does not match our current short_channel_id {:?}",
+				msg.short_channel_id, self.funding.get_short_channel_id(),
+			)));
+		}
+
 		if self.context.broadcasted_signed_announcement {
 			return Err(ChannelError::Ignore(
 				"Ignoring duplicate announcement_signatures - we already generated a signed channel_announcement for this channel"

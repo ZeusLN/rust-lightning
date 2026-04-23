@@ -1348,6 +1348,153 @@ fn do_test_splice_reestablish(reload: bool, async_monitor_update: bool) {
 }
 
 #[test]
+fn test_stale_announcement_signatures_ignored_after_splice_lock() {
+	// Regression test: a peer may transmit `announcement_signatures` signed over a pre-splice
+	// `short_channel_id` (for example, a stale retransmission or a peer implementation that
+	// hasn't yet caught up to our post-splice promotion). Verifying those sigs against the
+	// post-splice `UnsignedChannelAnnouncement` will always fail the hash check, but that is not
+	// a protocol violation — the spec permits ignoring and the channel should stay open.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+
+	let initial_channel_value_sat = 100_000;
+	// Use the lower-level helper so we get the signed `ChannelAnnouncement` back — the test
+	// needs node 1's pre-splice announcement signatures to replay later.
+	let chan_announcement =
+		create_chan_between_nodes_with_value(&nodes[0], &nodes[1], initial_channel_value_sat, 0);
+	let channel_id = chan_announcement.3;
+	update_nodes_with_chan_announce(
+		&nodes,
+		0,
+		1,
+		&chan_announcement.0,
+		&chan_announcement.1,
+		&chan_announcement.2,
+	);
+
+	// Extract node 1's pre-splice signatures from the ChannelAnnouncement. `UnsignedChannelAnnouncement`
+	// orders `node_id_1`/`node_id_2` by serialized pubkey; node 1's sigs are in slot 1 iff node 1's
+	// pubkey is lexicographically smaller.
+	let node_1_is_node_one = node_id_1.serialize() < node_id_0.serialize();
+	let (stale_node_sig, stale_bitcoin_sig) = if node_1_is_node_one {
+		(chan_announcement.0.node_signature_1, chan_announcement.0.bitcoin_signature_1)
+	} else {
+		(chan_announcement.0.node_signature_2, chan_announcement.0.bitcoin_signature_2)
+	};
+
+	// Capture the pre-splice `short_channel_id` — this is the scid the stale sigs sign over.
+	let pre_splice_scid = nodes[0].node.list_channels()[0].short_channel_id.unwrap();
+
+	let initiator_contribution = SpliceContribution::SpliceOut {
+		outputs: vec![
+			TxOut {
+				value: Amount::from_sat(initial_channel_value_sat / 4),
+				script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+			},
+			TxOut {
+				value: Amount::from_sat(initial_channel_value_sat / 4),
+				script_pubkey: nodes[1].wallet_source.get_change_script().unwrap(),
+			},
+		],
+	};
+	let splice_tx = splice_channel(&nodes[0], &nodes[1], channel_id, initiator_contribution);
+	mine_transaction(&nodes[0], &splice_tx);
+	mine_transaction(&nodes[1], &splice_tx);
+
+	let (prev_funding_outpoint, prev_funding_script) = nodes[0]
+		.chain_monitor
+		.chain_monitor
+		.get_monitor(channel_id)
+		.map(|monitor| (monitor.get_funding_txo(), monitor.get_funding_script()))
+		.unwrap();
+
+	// Lock the splice by hand so the stale sigs can be delivered after node 0 has promoted but
+	// before node 1's post-splice `announcement_signatures` arrive. At that point node 0 has not
+	// yet broadcast a signed announcement for the new funding, so the duplicate check does not
+	// apply and only the `short_channel_id` check keeps the channel open.
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
+
+	let splice_locked_for_node_1 =
+		get_event_msg!(nodes[0], MessageSendEvent::SendSpliceLocked, node_id_1);
+	nodes[1].node.handle_splice_locked(node_id_0, &splice_locked_for_node_1);
+
+	let mut msg_events = nodes[1].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 2, "{msg_events:?}");
+	let splice_locked_for_node_0 = match msg_events.remove(0) {
+		MessageSendEvent::SendSpliceLocked { msg, .. } => msg,
+		_ => panic!(),
+	};
+	let announcement_sigs_for_node_0 = match msg_events.remove(0) {
+		MessageSendEvent::SendAnnouncementSignatures { msg, .. } => msg,
+		_ => panic!(),
+	};
+	nodes[0].node.handle_splice_locked(node_id_1, &splice_locked_for_node_0);
+
+	expect_channel_ready_event(&nodes[0], &node_id_1);
+	check_added_monitors(&nodes[0], 1);
+	expect_channel_ready_event(&nodes[1], &node_id_0);
+	check_added_monitors(&nodes[1], 1);
+
+	// The post-splice scid is now different; confirm that.
+	let post_splice_scid = nodes[0].node.list_channels()[0].short_channel_id.unwrap();
+	assert_ne!(pre_splice_scid, post_splice_scid);
+
+	// Replay node 1's pre-splice announcement signatures, now stale (the current scid is the
+	// post-splice one). This is the exact shape of message a peer would send if it retransmitted
+	// an old `announcement_signatures` across a splice handoff.
+	let stale_sigs = msgs::AnnouncementSignatures {
+		channel_id,
+		short_channel_id: pre_splice_scid,
+		node_signature: stale_node_sig,
+		bitcoin_signature: stale_bitcoin_sig,
+	};
+	nodes[0].node.handle_announcement_signatures(node_id_1, &stale_sigs);
+
+	// No force-close and no events. The channel must still be listed.
+	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+	assert_eq!(nodes[0].node.list_channels().len(), 1);
+
+	// The post-splice announcement still completes. Node 0's only messages are its own
+	// `announcement_signatures` and the channel announcement, not an error.
+	nodes[0].node.handle_announcement_signatures(node_id_1, &announcement_sigs_for_node_0);
+	let mut msg_events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 2, "{msg_events:?}");
+	match msg_events.remove(0) {
+		MessageSendEvent::SendAnnouncementSignatures { msg, .. } => {
+			nodes[1].node.handle_announcement_signatures(node_id_0, &msg);
+		},
+		_ => panic!(),
+	}
+	match msg_events.remove(0) {
+		MessageSendEvent::BroadcastChannelAnnouncement { .. } => {},
+		_ => panic!(),
+	}
+	let mut msg_events = nodes[1].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 1, "{msg_events:?}");
+	match msg_events.remove(0) {
+		MessageSendEvent::BroadcastChannelAnnouncement { .. } => {},
+		_ => panic!(),
+	}
+
+	nodes[0]
+		.chain_source
+		.remove_watched_txn_and_outputs(prev_funding_outpoint, prev_funding_script.clone());
+	nodes[1]
+		.chain_source
+		.remove_watched_txn_and_outputs(prev_funding_outpoint, prev_funding_script);
+
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+}
+
+#[test]
 fn test_propose_splice_while_disconnected() {
 	do_test_propose_splice_while_disconnected(false, false);
 	do_test_propose_splice_while_disconnected(false, true);
