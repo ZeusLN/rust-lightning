@@ -114,7 +114,7 @@ use crate::onion_message::messenger::{
 };
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
 use crate::routing::router::{
-	BlindedTail, FixedRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route,
+	BlindedTail, FixedRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route, RouteHint,
 	RouteParameters, RouteParametersConfig, Router,
 };
 use crate::sign::ecdsa::EcdsaChannelSigner;
@@ -12562,7 +12562,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	) -> Result<Bolt11Invoice, SignOrCreationError<()>> {
 		let Bolt11InvoiceParameters {
 			amount_msats, description, invoice_expiry_delta_secs, min_final_cltv_expiry_delta,
-			payment_hash,
+			payment_hash, route_hints_override,
 		} = params;
 
 		let currency =
@@ -12636,8 +12636,16 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			invoice = invoice.amount_milli_satoshis(amount_msats);
 		}
 
-		let channels = self.list_channels();
-		let route_hints = super::invoice_utils::sort_and_filter_channels(channels, amount_msats, &self.logger);
+		let route_hints = match route_hints_override {
+			Some(hints) => hints,
+			None => {
+				let channels: Vec<ChannelDetails> = self.list_channels();
+				super::invoice_utils::sort_and_filter_channels(
+					channels, amount_msats, &self.logger,
+				)
+				.collect()
+			},
+		};
 		for hint in route_hints {
 			invoice = invoice.private_route(hint);
 		}
@@ -12684,6 +12692,11 @@ pub struct Bolt11InvoiceParameters {
 	/// involving another protocol where the payment hash is also involved outside the scope of
 	/// lightning.
 	pub payment_hash: Option<PaymentHash>,
+
+	/// Override the route hints included in the invoice. If `None`, route hints will be automatically
+	/// selected from eligible channels. If `Some(vec![])`, no route hints will be included. If
+	/// `Some(hints)`, the given hints will be used.
+	pub route_hints_override: Option<Vec<RouteHint>>,
 }
 
 impl Default for Bolt11InvoiceParameters {
@@ -12694,6 +12707,7 @@ impl Default for Bolt11InvoiceParameters {
 			invoice_expiry_delta_secs: None,
 			min_final_cltv_expiry_delta: None,
 			payment_hash: None,
+			route_hints_override: None,
 		}
 	}
 }
