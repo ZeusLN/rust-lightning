@@ -12718,7 +12718,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let route_hints = match route_hints_override {
 			Some(hints) => hints,
 			None => {
-				let channels: Vec<ChannelDetails> = self.list_channels();
+				let channels = self.list_channels();
 				super::invoice_utils::sort_and_filter_channels(
 					channels, amount_msats, &self.logger,
 				)
@@ -12774,7 +12774,9 @@ pub struct Bolt11InvoiceParameters {
 
 	/// Override the route hints included in the invoice. If `None`, route hints will be automatically
 	/// selected from eligible channels. If `Some(vec![])`, no route hints will be included. If
-	/// `Some(hints)`, the given hints will be used.
+	/// `Some(hints)`, the given hints will be used as-is with no validation and no cap (automatic
+	/// selection caps at three hints), so the caller is responsible for hint correctness and
+	/// invoice/QR size.
 	pub route_hints_override: Option<Vec<RouteHint>>,
 }
 
