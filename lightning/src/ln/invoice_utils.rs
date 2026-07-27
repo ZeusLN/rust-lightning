@@ -724,6 +724,64 @@ mod test {
 		assert_eq!(events.len(), 2);
 	}
 
+	fn make_route_hints_override_test_params(
+		route_hints_override: Option<Vec<RouteHint>>,
+	) -> Bolt11InvoiceParameters {
+		Bolt11InvoiceParameters {
+			amount_msats: Some(10_000),
+			description: Bolt11InvoiceDescription::Direct(
+				Description::new("test".to_string()).unwrap(),
+			),
+			invoice_expiry_delta_secs: Some(3600),
+			route_hints_override,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn test_create_bolt11_invoice_route_hints_override() {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 10_001);
+
+		let invoice = nodes[1]
+			.node
+			.create_bolt11_invoice(make_route_hints_override_test_params(None))
+			.unwrap();
+		let chan = &nodes[1].node.list_usable_channels()[0];
+		assert_eq!(invoice.route_hints().len(), 1);
+		assert_eq!(
+			invoice.route_hints()[0].0[0].short_channel_id,
+			chan.inbound_scid_alias.unwrap()
+		);
+		assert_eq!(invoice.route_hints()[0].0[0].htlc_minimum_msat, chan.inbound_htlc_minimum_msat);
+		assert_eq!(invoice.route_hints()[0].0[0].htlc_maximum_msat, chan.inbound_htlc_maximum_msat);
+
+		let invoice = nodes[1]
+			.node
+			.create_bolt11_invoice(make_route_hints_override_test_params(Some(vec![])))
+			.unwrap();
+		assert!(invoice.route_hints().is_empty());
+
+		let custom_hint = RouteHint(vec![RouteHintHop {
+			src_node_id: nodes[0].node.get_our_node_id(),
+			short_channel_id: 42,
+			fees: RoutingFees { base_msat: 1000, proportional_millionths: 500 },
+			cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA,
+			htlc_minimum_msat: Some(1),
+			htlc_maximum_msat: Some(1_000_000),
+		}]);
+		let invoice = nodes[1]
+			.node
+			.create_bolt11_invoice(make_route_hints_override_test_params(Some(vec![
+				custom_hint.clone()
+			])))
+			.unwrap();
+		assert_eq!(invoice.route_hints(), vec![custom_hint]);
+	}
+
 	fn do_create_invoice_min_final_cltv_delta(with_custom_delta: bool) {
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
