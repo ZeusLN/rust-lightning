@@ -1762,6 +1762,7 @@ fn lsps5_service_persist_resets_in_flight_counter_on_io_error() {
 		lsps1_client_config: None,
 		lsps2_client_config: None,
 		lsps5_client_config: Some(LSPS5ClientConfig::default()),
+		lsps7_client_config: None,
 	};
 	let time_provider: Arc<dyn TimeProvider + Send + Sync> = Arc::new(DefaultTimeProvider);
 
