@@ -6971,6 +6971,14 @@ where
 		&self.context
 	}
 
+	/// ZEUS test hook: forget the cached revoked points, as for a channel persisted before the
+	/// cache existed whose signer could not supply them at load.
+	#[cfg(test)]
+	pub fn clear_revoked_point_cache(&mut self) {
+		self.holder_commitment_point.previous_revoked_point = None;
+		self.holder_commitment_point.last_revoked_point = None;
+	}
+
 	pub fn force_shutdown(&mut self, closure_reason: ClosureReason) -> ShutdownResult {
 		let splice_funding_failed = self.maybe_fail_splice_negotiation();
 
@@ -9902,15 +9910,31 @@ where
 					return Err(ChannelError::close("Peer sent a channel_reestablish indicating we're stale with an invalid commitment secret".to_owned()));
 				}
 				Self::panic_on_stale_state(logger);
-			} else if msg.next_remote_commitment_number == our_commitment_transaction {
-				let expected_point = self.holder_commitment_point.last_revoked_point()
-					.expect("The last revoked commitment point must exist when the state has advanced");
-				if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret) {
-					return Err(ChannelError::close("Peer sent a garbage channel_reestablish with secret key not matching the commitment height provided".to_owned()));
-				}
-			} else if msg.next_remote_commitment_number + 1 == our_commitment_transaction {
-				let expected_point = self.holder_commitment_point.previous_revoked_point()
-					.expect("The previous revoked commitment point must exist when they are one state behind");
+			} else if msg.next_remote_commitment_number == our_commitment_transaction
+				|| msg.next_remote_commitment_number + 1 == our_commitment_transaction
+			{
+				let cached_point = if msg.next_remote_commitment_number == our_commitment_transaction {
+					self.holder_commitment_point.last_revoked_point()
+				} else {
+					self.holder_commitment_point.previous_revoked_point()
+				};
+				// ZEUS: the point is not cached only for a channel persisted before the cache
+				// existed whose signer could not supply it at load (see the ChannelManager read
+				// path). Ask the signer now; if it still cannot answer, disconnect and let the
+				// peer retry, rather than panic as upstream's `expect` would.
+				let expected_point = match cached_point {
+					Some(point) => point,
+					None => match self.context.holder_signer.as_ref().get_per_commitment_point(
+						INITIAL_COMMITMENT_NUMBER - msg.next_remote_commitment_number + 1,
+						&self.context.secp_ctx,
+					) {
+						Ok(point) => point,
+						Err(()) => {
+							log_info!(logger, "Signer could not provide the revoked point to verify channel_reestablish");
+							return Err(ChannelError::WarnAndDisconnect("Channel is not ready to be reestablished yet".to_owned()));
+						},
+					},
+				};
 				if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret) {
 					return Err(ChannelError::close("Peer sent a garbage channel_reestablish with secret key not matching the commitment height provided".to_owned()));
 				}
@@ -15618,29 +15642,35 @@ where
 				}
 			});
 
+			// ZEUS: a channel persisted before these points were cached derives them from the
+			// signer here. Upstream `expect`s the result; with a remote signer (VLS) that has
+			// lost or not yet restored this channel's state, that would make every node restart
+			// abort while reading the ChannelManager. Leave the point unset instead:
+			// `channel_reestablish` then asks the signer and disconnects on a refusal, and the
+			// next read tries again until a write persists the points.
 			let previous_revoked_point =
 				holder_commitment_point_previous_revoked_opt.or_else(|| {
 					if holder_commitment_next_transaction_number > INITIAL_COMMITMENT_NUMBER - 3 {
 						None
 					} else {
-						Some(holder_signer
-						.get_per_commitment_point(
-							holder_commitment_next_transaction_number + 3,
-							&secp_ctx,
-						)
-						.expect("Must be able to derive the previous revoked commitment point upon channel restoration"))
+						holder_signer
+							.get_per_commitment_point(
+								holder_commitment_next_transaction_number + 3,
+								&secp_ctx,
+							)
+							.ok()
 					}
 				});
 			let last_revoked_point = holder_commitment_point_last_revoked_opt.or_else(|| {
 				if holder_commitment_next_transaction_number > INITIAL_COMMITMENT_NUMBER - 2 {
 					None
 				} else {
-					Some(holder_signer
+					holder_signer
 						.get_per_commitment_point(
 							holder_commitment_next_transaction_number + 2,
 							&secp_ctx,
 						)
-						.expect("Must be able to derive the last revoked commitment point upon channel restoration"))
+						.ok()
 				}
 			});
 
