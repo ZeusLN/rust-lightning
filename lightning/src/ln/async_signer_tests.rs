@@ -1761,3 +1761,83 @@ fn test_async_force_close_on_invalid_secret_for_stale_state() {
 	check_closed_broadcast(&nodes[1], 1, true);
 	check_closed_event(&nodes[1], 1, closure_reason, false, &[node_id_0], 100_000);
 }
+
+#[test]
+fn test_reestablish_needs_no_signer_point_when_cached() {
+	// ZEUS: the peer's `channel_reestablish` proves a state we already know, so it is verified
+	// against the cached revoked point without asking the signer. A remote signer that refuses the
+	// point (VLS behind LDK after a restart) no longer takes the node down on reconnect.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+	let chan_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+	nodes[0].node.peer_disconnected(node_id_1);
+	nodes[1].node.peer_disconnected(node_id_0);
+	nodes[1].disable_channel_signer_op(&node_id_0, &chan_id, SignerOp::GetPerCommitmentPoint);
+
+	reconnect_nodes(ReconnectArgs::new(&nodes[0], &nodes[1]));
+
+	nodes[1].enable_channel_signer_op(&node_id_0, &chan_id, SignerOp::GetPerCommitmentPoint);
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+}
+
+#[test]
+fn test_reestablish_disconnects_when_uncached_point_is_refused() {
+	// ZEUS: a channel persisted before the revoked points were cached, whose signer could not
+	// supply them at load, has none cached. `channel_reestablish` then asks the signer; a refusal
+	// disconnects with a warning instead of panicking, the channel stays open, and a later
+	// reconnect succeeds once the signer answers.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+	let chan_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+	nodes[0].node.peer_disconnected(node_id_1);
+	nodes[1].node.peer_disconnected(node_id_0);
+	{
+		let mut per_peer_lock;
+		let mut peer_state_lock;
+		get_channel_ref!(nodes[1], nodes[0], per_peer_lock, peer_state_lock, chan_id)
+			.as_funded_mut()
+			.unwrap()
+			.clear_revoked_point_cache();
+	}
+	nodes[1].disable_channel_signer_op(&node_id_0, &chan_id, SignerOp::GetPerCommitmentPoint);
+
+	connect_nodes(&nodes[0], &nodes[1]);
+	let reestablish_0_to_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
+	let _ = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
+	nodes[1].node.handle_channel_reestablish(node_id_0, &reestablish_0_to_1[0]);
+
+	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+	let msg_events = nodes[1].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 1);
+	match &msg_events[0] {
+		MessageSendEvent::HandleError {
+			action: ErrorAction::DisconnectPeerWithWarning { .. },
+			..
+		} => {},
+		_ => panic!("Unexpected event"),
+	}
+	check_added_monitors(&nodes[1], 0);
+	assert_eq!(nodes[1].node.list_channels().len(), 1);
+
+	nodes[0].node.peer_disconnected(node_id_1);
+	nodes[1].node.peer_disconnected(node_id_0);
+	nodes[1].enable_channel_signer_op(&node_id_0, &chan_id, SignerOp::GetPerCommitmentPoint);
+
+	reconnect_nodes(ReconnectArgs::new(&nodes[0], &nodes[1]));
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+}
