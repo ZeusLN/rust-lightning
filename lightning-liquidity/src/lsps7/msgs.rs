@@ -43,29 +43,31 @@ pub enum LSPS7OrderState {
 	Failed,
 }
 
-/// A reference to the original LSPS1 order that opened the channel.
+/// A reference to the order through which a channel was originally purchased.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LSPS7OriginalOrder {
 	/// The id of the original order.
 	pub id: String,
-	/// The service that created the original order.
+	/// The uppercase name of the LSPS spec the channel was purchased through, e.g. `LSPS1`.
 	pub service: String,
 }
 
 /// An object representing a channel eligible for lease extension.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LSPS7ExtendableChannel {
-	/// A reference to the original order, if applicable.
+	/// A reference to the original order.
+	///
+	/// Omitted for channels not opened through an order with an id, e.g. LSPS2 channels.
 	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub original_order: Option<LSPS7OriginalOrder>,
-	/// The ids of any previous extension orders on this channel.
+	/// The ids of previous completed extension orders on this channel, oldest first.
 	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub extension_order_ids: Option<Vec<String>>,
 	/// The short channel id in "NNNxNNNxNNN" format.
 	pub short_channel_id: String,
-	/// The maximum number of blocks the channel lease can be extended by.
+	/// The maximum number of blocks a single extension order can extend the lease by.
 	pub max_channel_extension_expiry_blocks: u32,
 	/// The current expiration block of the channel lease.
 	pub expiration_block: u32,
@@ -211,7 +213,7 @@ mod tests {
 		let json_str = r#"{
 			"original_order": {
 				"id": "bb4b5d0a-8334-49d8-9463-90a6d413af7c",
-				"service": "lsps1"
+				"service": "LSPS1"
 			},
 			"extension_order_ids": ["cc5c6e1b-9445-50e9-0574-01b7e524af8d"],
 			"short_channel_id": "761432x100x0",
@@ -222,7 +224,9 @@ mod tests {
 		assert_eq!(channel.short_channel_id, "761432x100x0");
 		assert_eq!(channel.max_channel_extension_expiry_blocks, 52560);
 		assert_eq!(channel.expiration_block, 850000);
-		assert!(channel.original_order.is_some());
+		let original_order = channel.original_order.unwrap();
+		assert_eq!(original_order.id, "bb4b5d0a-8334-49d8-9463-90a6d413af7c");
+		assert_eq!(original_order.service, "LSPS1");
 		assert!(channel.extension_order_ids.is_some());
 	}
 
