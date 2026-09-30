@@ -1,0 +1,380 @@
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+#![cfg(all(test, feature = "time"))]
+
+mod common;
+
+use common::{create_service_and_client_nodes, get_lsps_message, LSPSNodes};
+
+use lightning::ln::functional_test_utils::{
+	create_chanmon_cfgs, create_network, create_node_cfgs, create_node_chanmgrs, Node,
+};
+use lightning::ln::peer_handler::CustomMessageHandler;
+use lightning_liquidity::events::LiquidityEvent;
+use lightning_liquidity::lsps0::ser::{LSPSDateTime, LSPSRequestId, RawLSPSMessage};
+use lightning_liquidity::lsps7::client::LSPS7ClientConfig;
+use lightning_liquidity::lsps7::event::LSPS7ClientEvent;
+use lightning_liquidity::lsps7::msgs::{LSPS7OrderId, LSPS7OrderState};
+use lightning_liquidity::utils::time::DefaultTimeProvider;
+use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
+
+use bitcoin::Address;
+
+use serde_json::{json, Value};
+
+use std::str::FromStr;
+use std::sync::Arc;
+
+const BOLT11_INVOICE: &str = "lnbc252u1p3aht9ysp580g4633gd2x9lc5al0wd8wx0mpn9748jeyz46kqjrpxn52uhfpjqpp5qgf67tcqmuqehzgjm8mzya90h73deafvr4m5705l5u5l4r05l8cqdpud3h8ymm4w3jhytnpwpczqmt0de6xsmre2pkxzm3qydmkzdjrdev9s7zhgfaqxqyjw5qcqpjrzjqt6xptnd85lpqnu2lefq4cx070v5cdwzh2xlvmdgnu7gqp4zvkus5zapryqqx9qqqyqqqqqqqqqqqcsq9q9qyysgqen77vu8xqjelum24hgjpgfdgfgx4q0nehhalcmuggt32japhjuksq9jv6eksjfnppm4hrzsgyxt8y8xacxut9qv3fpyetz8t7tsymygq8yzn05";
+const ONCHAIN_ADDRESS: &str = "bc1p5uvtaxzkjwvey2tfy49k5vtqfpjmrgm09cvs88ezyy8h2zv7jhas9tu4yr";
+const ORDER_ID: &str = "cc5c6e1b-9445-50e9-0574-01b7e524af8d";
+const SCID: &str = "761432x100x0";
+
+fn setup_test_lsps7_nodes<'a, 'b, 'c>(nodes: Vec<Node<'a, 'b, 'c>>) -> LSPSNodes<'a, 'b, 'c> {
+	let service_config = LiquidityServiceConfig {
+		lsps1_service_config: None,
+		lsps2_service_config: None,
+		lsps5_service_config: None,
+		advertise_service: false,
+	};
+	let client_config = LiquidityClientConfig {
+		lsps1_client_config: None,
+		lsps2_client_config: None,
+		lsps5_client_config: None,
+		lsps7_client_config: Some(LSPS7ClientConfig {}),
+	};
+	create_service_and_client_nodes(
+		nodes,
+		service_config,
+		client_config,
+		Arc::new(DefaultTimeProvider),
+	)
+}
+
+/// Parses an outgoing JSON-RPC request, checks its method and id, and returns its params.
+fn parse_request(
+	message: RawLSPSMessage, expected_method: &str, expected_id: &LSPSRequestId,
+) -> Value {
+	let request: Value = serde_json::from_str(&message.payload).unwrap();
+	assert_eq!(request["jsonrpc"], "2.0");
+	assert_eq!(request["method"], expected_method);
+	assert_eq!(request["id"], expected_id.0.as_str());
+	request["params"].clone()
+}
+
+fn result_message(request_id: &LSPSRequestId, result: Value) -> RawLSPSMessage {
+	let payload = json!({ "jsonrpc": "2.0", "id": request_id.0, "result": result });
+	RawLSPSMessage { payload: payload.to_string() }
+}
+
+fn error_message(request_id: &LSPSRequestId, code: i32, message: &str) -> RawLSPSMessage {
+	let payload = json!({
+		"jsonrpc": "2.0",
+		"id": request_id.0,
+		"error": { "code": code, "message": message },
+	});
+	RawLSPSMessage { payload: payload.to_string() }
+}
+
+fn extendable_channel() -> Value {
+	json!({
+		"original_order": { "id": "bb4b5d0a-8334-49d8-9463-90a6d413af7c", "service": "LSPS1" },
+		"short_channel_id": SCID,
+		"max_channel_extension_expiry_blocks": 52560,
+		"expiration_block": 850000,
+	})
+}
+
+fn bolt11_payment(state: &str) -> Value {
+	json!({
+		"state": state,
+		"expires_at": "2035-01-01T00:00:00Z",
+		"fee_total_sat": "8888",
+		"order_total_sat": "8888",
+		"invoice": BOLT11_INVOICE,
+	})
+}
+
+fn onchain_payment() -> Value {
+	json!({
+		"state": "EXPECT_PAYMENT",
+		"expires_at": "2035-01-01T00:00:00Z",
+		"fee_total_sat": "9999",
+		"order_total_sat": "9999",
+		"address": ONCHAIN_ADDRESS,
+		"min_onchain_payment_confirmations": 1,
+		"min_fee_for_0conf": 253,
+	})
+}
+
+#[test]
+fn get_extendable_channels_flow() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } = setup_test_lsps7_nodes(nodes);
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps7_client_handler().unwrap();
+
+	let request_id = client_handler.request_extendable_channels(service_node_id);
+	let request = get_lsps_message!(client_node, service_node_id);
+	let params = parse_request(request, "lsps7.get_extendable_channels", &request_id);
+	assert_eq!(params, json!({}));
+
+	let lsps2_channel = json!({
+		"short_channel_id": "761433x200x1",
+		"max_channel_extension_expiry_blocks": 4320,
+		"expiration_block": 860000,
+	});
+	let response = result_message(
+		&request_id,
+		json!({ "extendable_channels": [extendable_channel(), lsps2_channel] }),
+	);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::ExtendableChannelsReady {
+			request_id: event_request_id,
+			counterparty_node_id,
+			extendable_channels,
+		}) => {
+			assert_eq!(event_request_id, request_id);
+			assert_eq!(counterparty_node_id, service_node_id);
+			assert_eq!(extendable_channels.len(), 2);
+			let original_order = extendable_channels[0].original_order.as_ref().unwrap();
+			assert_eq!(original_order.service, "LSPS1");
+			assert_eq!(extendable_channels[0].short_channel_id, SCID);
+			assert!(extendable_channels[1].original_order.is_none());
+			assert_eq!(extendable_channels[1].max_channel_extension_expiry_blocks, 4320);
+		},
+		event => panic!("Unexpected event: {:?}", event),
+	}
+	assert!(client_node.liquidity_manager.next_event().is_none());
+}
+
+#[test]
+fn create_order_flow() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } = setup_test_lsps7_nodes(nodes);
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps7_client_handler().unwrap();
+
+	let refund_address = Address::from_str(ONCHAIN_ADDRESS).unwrap().assume_checked();
+	let request_id = client_handler.create_order(
+		&service_node_id,
+		SCID.to_string(),
+		20160,
+		Some("coupon".to_string()),
+		Some(refund_address),
+	);
+	let request = get_lsps_message!(client_node, service_node_id);
+	let params = parse_request(request, "lsps7.create_order", &request_id);
+	assert_eq!(
+		params,
+		json!({
+			"short_channel_id": SCID,
+			"channel_extension_expiry_blocks": 20160,
+			"token": "coupon",
+			"refund_onchain_address": ONCHAIN_ADDRESS,
+		})
+	);
+
+	let result = json!({
+		"order_id": ORDER_ID,
+		"channel_extension_expiry_blocks": 20160,
+		"new_channel_expiry_block": 870160,
+		"token": "coupon",
+		"created_at": "2025-01-01T00:00:00Z",
+		"order_state": "CREATED",
+		"payment": {
+			"bolt11": bolt11_payment("EXPECT_PAYMENT"),
+			"onchain": onchain_payment(),
+		},
+		"channel": extendable_channel(),
+	});
+	let response = result_message(&request_id, result);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::OrderCreated {
+			request_id: event_request_id,
+			counterparty_node_id,
+			order_id,
+			order_state,
+			channel_extension_expiry_blocks,
+			new_channel_expiry_block,
+			token,
+			created_at,
+			payment,
+			channel,
+		}) => {
+			assert_eq!(event_request_id, request_id);
+			assert_eq!(counterparty_node_id, service_node_id);
+			assert_eq!(order_id, LSPS7OrderId(ORDER_ID.to_string()));
+			assert_eq!(order_state, LSPS7OrderState::Created);
+			assert_eq!(channel_extension_expiry_blocks, 20160);
+			assert_eq!(new_channel_expiry_block, 870160);
+			assert_eq!(token, "coupon");
+			assert_eq!(created_at, LSPSDateTime::from_str("2025-01-01T00:00:00Z").unwrap());
+			assert!(payment.bolt11.is_some());
+			assert!(payment.bolt12.is_none());
+			assert!(payment.onchain.is_some());
+			assert_eq!(channel.short_channel_id, SCID);
+		},
+		event => panic!("Unexpected event: {:?}", event),
+	}
+	assert!(client_node.liquidity_manager.next_event().is_none());
+}
+
+#[test]
+fn check_order_status_without_token() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } = setup_test_lsps7_nodes(nodes);
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps7_client_handler().unwrap();
+
+	let request_id =
+		client_handler.check_order_status(&service_node_id, LSPS7OrderId(ORDER_ID.to_string()));
+	let request = get_lsps_message!(client_node, service_node_id);
+	let params = parse_request(request, "lsps7.get_order", &request_id);
+	assert_eq!(params, json!({ "order_id": ORDER_ID }));
+
+	// The LSP omits `token` and offers only a BOLT 11 payment option.
+	let result = json!({
+		"order_id": ORDER_ID,
+		"channel_extension_expiry_blocks": 20160,
+		"new_channel_expiry_block": 870160,
+		"created_at": "2025-01-01T00:00:00Z",
+		"order_state": "COMPLETED",
+		"payment": { "bolt11": bolt11_payment("PAID") },
+		"channel": extendable_channel(),
+	});
+	let response = result_message(&request_id, result);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::OrderStatus {
+			request_id: event_request_id,
+			order_id,
+			order_state,
+			token,
+			payment,
+			..
+		}) => {
+			assert_eq!(event_request_id, request_id);
+			assert_eq!(order_id, LSPS7OrderId(ORDER_ID.to_string()));
+			assert_eq!(order_state, LSPS7OrderState::Completed);
+			assert_eq!(token, "");
+			assert!(payment.bolt11.is_some());
+			assert!(payment.bolt12.is_none());
+			assert!(payment.onchain.is_none());
+		},
+		event => panic!("Unexpected event: {:?}", event),
+	}
+
+	// The LSP must still be served after the response above.
+	let request_id = client_handler.request_extendable_channels(service_node_id);
+	let _ = get_lsps_message!(client_node, service_node_id);
+	let response = result_message(&request_id, json!({ "extendable_channels": [] }));
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::ExtendableChannelsReady {
+			extendable_channels,
+			..
+		}) => assert!(extendable_channels.is_empty()),
+		event => panic!("Unexpected event: {:?}", event),
+	}
+}
+
+#[test]
+fn error_responses() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } = setup_test_lsps7_nodes(nodes);
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps7_client_handler().unwrap();
+
+	let request_id = client_handler.request_extendable_channels(service_node_id);
+	let _ = get_lsps_message!(client_node, service_node_id);
+	let response = error_message(&request_id, -32603, "Internal error");
+	assert!(client_node
+		.liquidity_manager
+		.handle_custom_message(response, service_node_id)
+		.is_err());
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::ExtendableChannelsRequestFailed {
+			request_id: event_request_id,
+			counterparty_node_id,
+			error,
+		}) => {
+			assert_eq!(event_request_id, request_id);
+			assert_eq!(counterparty_node_id, service_node_id);
+			assert_eq!(error.code, -32603);
+			assert_eq!(error.message, "Internal error");
+		},
+		event => panic!("Unexpected event: {:?}", event),
+	}
+
+	// Optional request fields are left out of the request when unset.
+	let request_id =
+		client_handler.create_order(&service_node_id, "1x2x3".to_string(), 20160, None, None);
+	let request = get_lsps_message!(client_node, service_node_id);
+	let params = parse_request(request, "lsps7.create_order", &request_id);
+	assert_eq!(
+		params,
+		json!({ "short_channel_id": "1x2x3", "channel_extension_expiry_blocks": 20160 })
+	);
+	let response = error_message(&request_id, -32602, "Invalid params");
+	assert!(client_node
+		.liquidity_manager
+		.handle_custom_message(response, service_node_id)
+		.is_err());
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::OrderRequestFailed {
+			request_id: event_request_id,
+			error,
+			..
+		}) => {
+			assert_eq!(event_request_id, request_id);
+			assert_eq!(error.code, -32602);
+		},
+		event => panic!("Unexpected event: {:?}", event),
+	}
+
+	let request_id =
+		client_handler.check_order_status(&service_node_id, LSPS7OrderId(ORDER_ID.to_string()));
+	let _ = get_lsps_message!(client_node, service_node_id);
+	let response = error_message(&request_id, 101, "Order not found");
+	assert!(client_node
+		.liquidity_manager
+		.handle_custom_message(response, service_node_id)
+		.is_err());
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS7Client(LSPS7ClientEvent::OrderRequestFailed {
+			request_id: event_request_id,
+			error,
+			..
+		}) => {
+			assert_eq!(event_request_id, request_id);
+			assert_eq!(error.code, 101);
+		},
+		event => panic!("Unexpected event: {:?}", event),
+	}
+	assert!(client_node.liquidity_manager.next_event().is_none());
+}
