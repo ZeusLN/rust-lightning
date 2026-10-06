@@ -1247,7 +1247,13 @@ impl Clone for InMemorySigner {
 }
 
 impl InMemorySigner {
-	#[cfg(any(feature = "_test_utils", test))]
+	/// Builds a signer from keys the caller derived.
+	///
+	/// ZEUS: public with `pub_inmemory_signer_new` as well as `_test_utils`,
+	/// so a release build can sign with keys from another derivation (the
+	/// zeus-vls self-recovery kit derives vlsd's channel keys from the
+	/// customer's seed) without compiling LDK's test utilities.
+	#[cfg(any(feature = "_test_utils", feature = "pub_inmemory_signer_new", test))]
 	pub fn new(
 		funding_key: SecretKey, revocation_base_key: SecretKey, payment_key_v1: SecretKey,
 		payment_key_v2: SecretKey, v2_remote_key_derivation: bool,
@@ -1268,7 +1274,7 @@ impl InMemorySigner {
 		}
 	}
 
-	#[cfg(not(any(feature = "_test_utils", test)))]
+	#[cfg(not(any(feature = "_test_utils", feature = "pub_inmemory_signer_new", test)))]
 	fn new(
 		funding_key: SecretKey, revocation_base_key: SecretKey, payment_key_v1: SecretKey,
 		payment_key_v2: SecretKey, v2_remote_key_derivation: bool,
