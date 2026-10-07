@@ -116,4 +116,4 @@ CLIPPY() {
 
 CLIPPY
 # We allow some additional warnings in tests which we should fix, but which aren't currently a priority
-CLIPPY --tests "-A clippy::bool_assert_comparison -A clippy::assertions_on_constants -A clippy::needless-late-init -A clippy::field_reassign_with_default -A clippy::unnecessary_literal_unwrap"
+CLIPPY --tests "-A clippy::bool_assert_comparison -A clippy::assertions_on_constants -A clippy::needless-late-init -A clippy::field_reassign_with_default -A clippy::unnecessary_literal_unwrap -A clippy::manual_str_repeat"
