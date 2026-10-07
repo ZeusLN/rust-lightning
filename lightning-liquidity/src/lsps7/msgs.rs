@@ -23,8 +23,7 @@ use bitcoin::Address;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const LSPS7_GET_EXTENDABLE_CHANNELS_METHOD_NAME: &str =
-	"lsps7.get_extendable_channels";
+pub(crate) const LSPS7_GET_EXTENDABLE_CHANNELS_METHOD_NAME: &str = "lsps7.get_extendable_channels";
 pub(crate) const LSPS7_CREATE_ORDER_METHOD_NAME: &str = "lsps7.create_order";
 pub(crate) const LSPS7_GET_ORDER_METHOD_NAME: &str = "lsps7.get_order";
 
@@ -198,8 +197,7 @@ mod tests {
 	#[test]
 	fn get_extendable_channels_request_serialization() {
 		let json_str = r#"{}"#;
-		let _request: LSPS7GetExtendableChannelsRequest =
-			serde_json::from_str(json_str).unwrap();
+		let _request: LSPS7GetExtendableChannelsRequest = serde_json::from_str(json_str).unwrap();
 	}
 
 	#[test]
@@ -233,8 +231,7 @@ mod tests {
 				}
 			]
 		}"#;
-		let response: LSPS7GetExtendableChannelsResponse =
-			serde_json::from_str(json_str).unwrap();
+		let response: LSPS7GetExtendableChannelsResponse = serde_json::from_str(json_str).unwrap();
 		assert_eq!(response.extendable_channels.len(), 1);
 	}
 
