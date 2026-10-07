@@ -34,7 +34,12 @@ PIN_RELEASE_DEPS # pin the release dependencies
 # which are edition 2024 and thus not even parsable by our MSRV's cargo. `quinn` only reaches us as
 # an unused optional dependency of `reqwest`, so it is never built, but cargo still insists on
 # reading the manifests.
+# Starting with version 0.11.12, `quinn` requires `quinn-proto` 0.11.18, so pin it first.
+[ "$RUSTC_MINOR_VERSION" -lt 85 ] && cargo update -p quinn --precise "0.11.11" --verbose
 [ "$RUSTC_MINOR_VERSION" -lt 85 ] && cargo update -p quinn-proto --precise "0.11.15" --verbose
+
+# Starting with version 0.1.21, the `hyper-util` crate is edition 2024, which our MSRV's cargo cannot parse.
+[ "$RUSTC_MINOR_VERSION" -lt 85 ] && cargo update -p hyper-util --precise "0.1.20" --verbose
 
 export RUST_BACKTRACE=1
 
