@@ -1,5 +1,16 @@
 name: Continuous Integration Checks
 
+# ZEUS fork: upstream runs several jobs on its own self-hosted runners,
+# which this repository does not have (those jobs waited 24h and
+# failed). They run on ubuntu-latest here. The coverage job is dropped:
+# it only uploaded to upstream's Codecov project.
+#
+# Toolchains are pinned: 1.96.1 (the rustc zeus-vls builds with; bump
+# both together) in place of upstream's stable and beta, plus the MSRVs.
+# New releases add lints and break old dependencies (rustc 1.100 cannot
+# build the lightning 0.0.125 that lightning-tests uses), which says
+# nothing about the code ZEUS ships.
+
 on:
   push:
     branches-ignore:
@@ -14,13 +25,13 @@ concurrency:
 
 jobs:
   ext-test:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
-      - name: Install Rust stable toolchain
+      - name: Install Rust 1.96.1 toolchain
         run: |
-          rustup default stable
+          rustup default 1.96.1
       - name: Run externalized tests
         run: |
           cd ext-functional-test-demo
@@ -30,15 +41,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ self-hosted, windows-latest, macos-latest ]
-        toolchain: [ stable, beta, 1.63.0 ] # 1.63.0 is the MSRV for all crates but `lightning-transaction-sync`.
+        platform: [ ubuntu-latest, windows-latest, macos-latest ]
+        toolchain: [ 1.96.1, 1.63.0 ] # 1.63.0 is the MSRV for all crates but `lightning-transaction-sync`.
         exclude:
           - platform: windows-latest
             toolchain: 1.63.0
-          - platform: windows-latest
-            toolchain: beta
-          - platform: macos-latest
-            toolchain: beta
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -51,11 +58,11 @@ jobs:
         shell: bash
         run: echo "RUSTFLAGS=-C linker=rust-lld" >> "$GITHUB_ENV"
       - name: Install no-std-check dependencies for ARM Embedded
-        if: "matrix.platform == 'self-hosted'"
+        if: "matrix.platform == 'ubuntu-latest'"
         run: |
           rustup target add thumbv7m-none-eabi
       - name: shellcheck the CI and `contrib` scripts
-        if: "matrix.platform == 'self-hosted'"
+        if: "matrix.platform == 'ubuntu-latest'"
         run: |
           shellcheck ci/*.sh -aP ci
           shellcheck contrib/*.sh -aP contrib
@@ -71,7 +78,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: [ ubuntu-latest, macos-latest ]
-        toolchain: [ stable, beta, 1.75.0 ] # 1.75.0 is the MSRV for `lightning-transaction-sync`.
+        toolchain: [ 1.96.1, 1.75.0 ] # 1.75.0 is the MSRV for `lightning-transaction-sync`.
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -109,42 +116,10 @@ jobs:
         shell: bash # Default on Winblows is powershell
         run: CI_ENV=1 CI_MINIMIZE_DISK_USAGE=1 ./ci/ci-tx-sync-tests.sh
 
-  coverage:
-    strategy:
-      fail-fast: false
-    runs-on: self-hosted
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install Rust stable toolchain
-        run: |
-          rustup default stable
-      - name: Run tests with coverage generation
-        run: |
-          cargo install cargo-llvm-cov
-          export RUSTFLAGS="-Coverflow-checks=off"
-          cargo llvm-cov --features rest-client,rpc-client,tokio,serde --codecov --hide-instantiations --output-path=target/codecov.json
-          curl --verbose -O https://cli.codecov.io/latest/linux/codecov
-          chmod +x codecov
-          # Could you use this to fake the coverage report for your PR? Sure.
-          # Will anyone be impressed by your amazing coverage? No
-          # Maybe if codecov wasn't broken we wouldn't need to do this...
-          ./codecov --verbose upload-process --disable-search --fail-on-error -f target/codecov.json -t "f421b687-4dc2-4387-ac3d-dc3b2528af57" -F 'tests'
-          cargo clean
-      - name: Run fuzz coverage generation
-        run: |
-          ./contrib/generate_fuzz_coverage.sh --output-dir `pwd` --output-codecov-json
-          # Could you use this to fake the coverage report for your PR? Sure.
-          # Will anyone be impressed by your amazing coverage? No
-          # Maybe if codecov wasn't broken we wouldn't need to do this...
-          ./codecov --verbose upload-process --disable-search --fail-on-error -f fuzz-codecov.json -t "f421b687-4dc2-4387-ac3d-dc3b2528af57" -F 'fuzzing'
-
   benchmark:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: stable
+      TOOLCHAIN: 1.96.1
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -208,7 +183,7 @@ jobs:
   check_release:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: stable
+      TOOLCHAIN: 1.96.1
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -234,12 +209,13 @@ jobs:
           RUSTDOCFLAGS: '--cfg=taproot'
 
   check_docs:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       # While docs.rs builds using a nightly compiler (and we use some nightly features),
-      # nightly ends up randomly breaking builds occasionally, so we instead use beta
-      # and set RUSTC_BOOTSTRAP in check-docsrs.sh
-      TOOLCHAIN: beta
+      # nightly ends up randomly breaking builds occasionally, so we instead use a
+      # pinned release (ZEUS fork: upstream uses beta) and set RUSTC_BOOTSTRAP in
+      # check-docsrs.sh
+      TOOLCHAIN: 1.96.1
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -252,7 +228,7 @@ jobs:
         run: ci/check-docsrs.sh
 
   fuzz:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       TOOLCHAIN: 1.63
     steps:
@@ -285,13 +261,15 @@ jobs:
           cd fuzz
           RUSTFLAGS="--cfg=fuzzing --cfg=secp256k1_fuzz --cfg=hashes_fuzz" cargo test --verbose --color always --lib --bins -j8
           cargo clean
+      - name: Install honggfuzz build dependencies
+        run: sudo apt-get update && sudo apt-get install -y binutils-dev libunwind-dev
       - name: Run fuzzers
         run: cd fuzz && ./ci-fuzz.sh && cd ..
 
   linting:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: stable
+      TOOLCHAIN: 1.96.1
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
