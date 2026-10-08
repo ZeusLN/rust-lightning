@@ -11,9 +11,9 @@
 
 use super::event::LSPS7ClientEvent;
 use super::msgs::{
-	LSPS7CreateOrderRequest, LSPS7CreateOrderResponse,
-	LSPS7GetExtendableChannelsRequest, LSPS7GetExtendableChannelsResponse, LSPS7GetOrderRequest,
-	LSPS7Message, LSPS7OrderId, LSPS7Request, LSPS7Response,
+	LSPS7CreateOrderRequest, LSPS7CreateOrderResponse, LSPS7GetExtendableChannelsRequest,
+	LSPS7GetExtendableChannelsResponse, LSPS7GetOrderRequest, LSPS7Message, LSPS7OrderId,
+	LSPS7Request, LSPS7Response,
 };
 use crate::message_queue::MessageQueue;
 
@@ -85,9 +85,7 @@ where
 	/// Returns the used [`LSPSRequestId`], which will be returned via [`ExtendableChannelsReady`].
 	///
 	/// [`ExtendableChannelsReady`]: crate::lsps7::event::LSPS7ClientEvent::ExtendableChannelsReady
-	pub fn request_extendable_channels(
-		&self, counterparty_node_id: PublicKey,
-	) -> LSPSRequestId {
+	pub fn request_extendable_channels(&self, counterparty_node_id: PublicKey) -> LSPSRequestId {
 		let mut message_queue_notifier = self.pending_messages.notifier();
 
 		let request_id = crate::utils::generate_request_id(&self.entropy_source);
@@ -97,13 +95,10 @@ where
 				.entry(counterparty_node_id)
 				.or_insert(Mutex::new(PeerState::default()));
 			let mut peer_state_lock = inner_state_lock.lock().unwrap();
-			peer_state_lock
-				.pending_get_extendable_channels_requests
-				.insert(request_id.clone());
+			peer_state_lock.pending_get_extendable_channels_requests.insert(request_id.clone());
 		}
 
-		let request =
-			LSPS7Request::GetExtendableChannels(LSPS7GetExtendableChannelsRequest {});
+		let request = LSPS7Request::GetExtendableChannels(LSPS7GetExtendableChannelsRequest {});
 		let msg = LSPS7Message::Request(request_id.clone(), request).into();
 		message_queue_notifier.enqueue(&counterparty_node_id, msg);
 		request_id
@@ -120,10 +115,7 @@ where
 			Some(inner_state_lock) => {
 				let mut peer_state_lock = inner_state_lock.lock().unwrap();
 
-				if !peer_state_lock
-					.pending_get_extendable_channels_requests
-					.remove(&request_id)
-				{
+				if !peer_state_lock.pending_get_extendable_channels_requests.remove(&request_id) {
 					return Err(LightningError {
 						err: format!(
 							"Received get_extendable_channels response for an unknown request: {:?}",
@@ -161,10 +153,7 @@ where
 			Some(inner_state_lock) => {
 				let mut peer_state_lock = inner_state_lock.lock().unwrap();
 
-				if !peer_state_lock
-					.pending_get_extendable_channels_requests
-					.remove(&request_id)
-				{
+				if !peer_state_lock.pending_get_extendable_channels_requests.remove(&request_id) {
 					return Err(LightningError {
 						err: format!(
 							"Received get_extendable_channels error for an unknown request: {:?}",
@@ -174,13 +163,11 @@ where
 					});
 				}
 
-				event_queue_notifier.enqueue(
-					LSPS7ClientEvent::ExtendableChannelsRequestFailed {
-						request_id: request_id.clone(),
-						counterparty_node_id: *counterparty_node_id,
-						error: error.clone(),
-					},
-				);
+				event_queue_notifier.enqueue(LSPS7ClientEvent::ExtendableChannelsRequestFailed {
+					request_id: request_id.clone(),
+					counterparty_node_id: *counterparty_node_id,
+					error: error.clone(),
+				});
 
 				Err(LightningError {
 					err: format!(
@@ -346,8 +333,7 @@ where
 		let request_id = crate::utils::generate_request_id(&self.entropy_source);
 		peer_state_lock.pending_get_order_requests.insert(request_id.clone());
 
-		let request =
-			LSPS7Request::GetOrder(LSPS7GetOrderRequest { order_id: order_id.clone() });
+		let request = LSPS7Request::GetOrder(LSPS7GetOrderRequest { order_id: order_id.clone() });
 		let msg = LSPS7Message::Request(request_id.clone(), request).into();
 
 		message_queue_notifier.enqueue(&counterparty_node_id, msg);
@@ -449,8 +435,7 @@ where
 	}
 }
 
-impl<ES: Deref, K: Deref + Clone> LSPSProtocolMessageHandler
-	for LSPS7ClientHandler<ES, K>
+impl<ES: Deref, K: Deref + Clone> LSPSProtocolMessageHandler for LSPS7ClientHandler<ES, K>
 where
 	ES::Target: EntropySource,
 	K::Target: KVStore,
@@ -463,20 +448,14 @@ where
 	) -> Result<(), LightningError> {
 		match message {
 			LSPS7Message::Response(request_id, response) => match response {
-				LSPS7Response::GetExtendableChannels(params) => {
-					self.handle_get_extendable_channels_response(
+				LSPS7Response::GetExtendableChannels(params) => self
+					.handle_get_extendable_channels_response(
 						request_id,
 						counterparty_node_id,
 						params,
-					)
-				},
-				LSPS7Response::GetExtendableChannelsError(error) => {
-					self.handle_get_extendable_channels_error(
-						request_id,
-						counterparty_node_id,
-						error,
-					)
-				},
+					),
+				LSPS7Response::GetExtendableChannelsError(error) => self
+					.handle_get_extendable_channels_error(request_id, counterparty_node_id, error),
 				LSPS7Response::CreateOrder(params) => {
 					self.handle_create_order_response(request_id, counterparty_node_id, params)
 				},

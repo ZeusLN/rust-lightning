@@ -1299,9 +1299,7 @@ where
 	/// Returns a reference to the LSPS7 client-side handler.
 	///
 	/// Wraps [`LiquidityManager::lsps7_client_handler`].
-	pub fn lsps7_client_handler(
-		&self,
-	) -> Option<&LSPS7ClientHandler<ES, KVStoreSyncWrapper<KS>>> {
+	pub fn lsps7_client_handler(&self) -> Option<&LSPS7ClientHandler<ES, KVStoreSyncWrapper<KS>>> {
 		self.inner.lsps7_client_handler()
 	}
 
