@@ -13,21 +13,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: >-
-          ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'
-            && fromJSON('["self-hosted","windows-latest","macos-latest"]')
-            || fromJSON('["self-hosted"]') }}
-        toolchain: >-
-          ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'
-            && fromJSON('["stable","beta","1.75.0"]')
-            || fromJSON('["1.75.0"]') }}
+        # ZEUS fork: GitHub-hosted runners (upstream's self-hosted ones do not
+        # exist here) and pinned toolchains: 1.96.1 is the rustc zeus-vls
+        # builds with (bump both together), next to the 1.75.0 MSRV.
+        platform: [ ubuntu-latest, windows-latest, macos-latest ]
+        toolchain: [ 1.96.1, 1.75.0 ]
         exclude:
           - platform: windows-latest
             toolchain: 1.75.0
-          - platform: windows-latest
-            toolchain: beta
-          - platform: macos-latest
-            toolchain: beta
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -43,7 +36,7 @@ jobs:
         if: "matrix.toolchain == '1.75.0'"
         run: echo "RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
       - name: Install no-std-check dependencies for ARM Embedded
-        if: matrix.platform == 'self-hosted'
+        if: matrix.platform == 'ubuntu-latest'
         run: |
           rustup target add thumbv7m-none-eabi
       - name: Enable caching for bitcoind
