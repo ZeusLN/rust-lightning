@@ -25,7 +25,7 @@ use crate::lsps5::service::{LSPS5ServiceConfig, LSPS5ServiceHandler};
 use crate::message_queue::MessageQueue;
 use crate::persist::{
 	read_event_queue, read_lsps1_service_peer_states, read_lsps2_service_peer_states,
-	read_lsps5_service_peer_states,
+	read_lsps5_service_peer_states, read_lsps7_service_peer_states,
 };
 
 use crate::lsps1::client::{LSPS1ClientConfig, LSPS1ClientHandler};
@@ -34,6 +34,7 @@ use crate::lsps1::service::{LSPS1ServiceConfig, LSPS1ServiceHandler, LSPS1Servic
 
 use crate::lsps7::client::{LSPS7ClientConfig, LSPS7ClientHandler};
 use crate::lsps7::msgs::LSPS7Message;
+use crate::lsps7::service::{LSPS7ServiceConfig, LSPS7ServiceHandler, LSPS7ServiceHandlerSync};
 
 use crate::lsps2::client::{LSPS2ClientConfig, LSPS2ClientHandler};
 use crate::lsps2::msgs::LSPS2Message;
@@ -80,6 +81,8 @@ pub struct LiquidityServiceConfig {
 	pub lsps2_service_config: Option<LSPS2ServiceConfig>,
 	/// Optional server-side configuration for LSPS5 webhook service.
 	pub lsps5_service_config: Option<LSPS5ServiceConfig>,
+	/// Optional server-side configuration for LSPS7 channel lease extensions.
+	pub lsps7_service_config: Option<LSPS7ServiceConfig>,
 	/// Controls whether the liquidity service should be advertised via setting the feature bit in
 	/// node announcment and the init message.
 	pub advertise_service: bool,
@@ -295,6 +298,7 @@ pub struct LiquidityManager<
 	lsps5_service_handler: Option<LSPS5ServiceHandler<CM, NS, K, TP>>,
 	lsps5_client_handler: Option<LSPS5ClientHandler<ES, K>>,
 	lsps7_client_handler: Option<LSPS7ClientHandler<ES, K>>,
+	lsps7_service_handler: Option<LSPS7ServiceHandler<ES, K, TP>>,
 	service_config: Option<LiquidityServiceConfig>,
 	_client_config: Option<LiquidityClientConfig>,
 	pending_msgs_or_needs_persist_notifier: Arc<Notifier>,
@@ -483,8 +487,34 @@ where
 					Arc::clone(&pending_events),
 					channel_manager.clone(),
 					kv_store.clone(),
-					time_provider,
+					time_provider.clone(),
 					lsps1_service_config.clone(),
+				))
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+
+		let lsps7_service_handler = if let Some(service_config) = service_config.as_ref() {
+			if let Some(lsps7_service_config) = service_config.lsps7_service_config.as_ref() {
+				if let Some(number) =
+					<LSPS7ServiceHandler<ES, K, TP> as LSPSProtocolMessageHandler>::PROTOCOL_NUMBER
+				{
+					supported_protocols.push(number);
+				}
+
+				let peer_states = read_lsps7_service_peer_states(kv_store.clone()).await?;
+
+				Some(LSPS7ServiceHandler::new(
+					peer_states,
+					entropy_source.clone(),
+					Arc::clone(&pending_messages),
+					Arc::clone(&pending_events),
+					kv_store.clone(),
+					time_provider,
+					lsps7_service_config.clone(),
 				))
 			} else {
 				None
@@ -519,6 +549,7 @@ where
 			lsps5_client_handler,
 			lsps5_service_handler,
 			lsps7_client_handler,
+			lsps7_service_handler,
 			service_config,
 			_client_config: client_config,
 			pending_msgs_or_needs_persist_notifier,
@@ -546,6 +577,11 @@ where
 	/// Returns a reference to the LSPS1 server-side handler.
 	pub fn lsps1_service_handler(&self) -> Option<&LSPS1ServiceHandler<ES, CM, K, TP>> {
 		self.lsps1_service_handler.as_ref()
+	}
+
+	/// Returns a reference to the LSPS7 server-side handler.
+	pub fn lsps7_service_handler(&self) -> Option<&LSPS7ServiceHandler<ES, K, TP>> {
+		self.lsps7_service_handler.as_ref()
 	}
 
 	/// Returns a reference to the LSPS2 client-side handler.
@@ -667,6 +703,10 @@ where
 			did_persist |= lsps5_service_handler.persist().await?;
 		}
 
+		if let Some(lsps7_service_handler) = self.lsps7_service_handler.as_ref() {
+			did_persist |= lsps7_service_handler.persist().await?;
+		}
+
 		Ok(did_persist)
 	}
 
@@ -779,8 +819,15 @@ where
 					},
 				}
 			},
-			LSPSMessage::LSPS7(_msg @ LSPS7Message::Request(..)) => {
-				return Err(LightningError { err: format!("Received LSPS7 request message without LSPS7 service handler configured. From node {}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Debug)});
+			LSPSMessage::LSPS7(msg @ LSPS7Message::Request(..)) => {
+				match &self.lsps7_service_handler {
+					Some(lsps7_service_handler) => {
+						lsps7_service_handler.handle_message(msg, sender_node_id)?;
+					},
+					None => {
+						return Err(LightningError { err: format!("Received LSPS7 request message without LSPS7 service handler configured. From node {}", sender_node_id), action: ErrorAction::IgnoreAndLog(Level::Debug)});
+					},
+				}
 			},
 		}
 		Ok(())
@@ -932,6 +979,10 @@ where
 		if let Some(lsps5_service_handler) = self.lsps5_service_handler.as_ref() {
 			lsps5_service_handler.peer_disconnected(&counterparty_node_id);
 		}
+
+		if let Some(lsps7_service_handler) = self.lsps7_service_handler.as_ref() {
+			lsps7_service_handler.peer_disconnected(counterparty_node_id);
+		}
 	}
 	fn peer_connected(
 		&self, counterparty_node_id: bitcoin::secp256k1::PublicKey, _: &lightning::ln::msgs::Init,
@@ -1080,6 +1131,15 @@ where
 		&'a self,
 	) -> Option<LSPS1ServiceHandlerSync<'a, ES, CM, KVStoreSyncWrapper<KS>, TP>> {
 		self.inner.lsps1_service_handler.as_ref().map(|r| LSPS1ServiceHandlerSync::from_inner(r))
+	}
+
+	/// Returns a reference to the LSPS7 server-side handler.
+	///
+	/// Wraps [`LiquidityManager::lsps7_service_handler`].
+	pub fn lsps7_service_handler<'a>(
+		&'a self,
+	) -> Option<LSPS7ServiceHandlerSync<'a, ES, KVStoreSyncWrapper<KS>, TP>> {
+		self.inner.lsps7_service_handler.as_ref().map(|r| LSPS7ServiceHandlerSync::from_inner(r))
 	}
 
 	/// Returns a reference to the LSPS2 client-side handler.

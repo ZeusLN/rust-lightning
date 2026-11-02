@@ -21,15 +21,44 @@ use crate::lsps1::msgs::LSPS1PaymentInfo;
 
 use bitcoin::Address;
 
+use lightning::util::ser::{Readable, Writeable};
+
 use serde::{Deserialize, Serialize};
 
 pub(crate) const LSPS7_GET_EXTENDABLE_CHANNELS_METHOD_NAME: &str = "lsps7.get_extendable_channels";
 pub(crate) const LSPS7_CREATE_ORDER_METHOD_NAME: &str = "lsps7.create_order";
 pub(crate) const LSPS7_GET_ORDER_METHOD_NAME: &str = "lsps7.get_order";
 
+/// Error code for a `create_order` request with invalid parameters.
+pub const LSPS7_CREATE_ORDER_REQUEST_INVALID_PARAMS_ERROR_CODE: i32 = -32602;
+/// Error code for a `create_order` request naming a channel that is not extendable, or asking for
+/// an extension outside the channel's limits.
+pub const LSPS7_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE: i32 = 100;
+/// Error code for a `get_order` request naming an order the LSP does not know.
+pub const LSPS7_GET_ORDER_REQUEST_ORDER_NOT_FOUND_ERROR_CODE: i32 = 101;
+/// Error code for a `create_order` request with an unrecognized or stale token.
+pub const LSPS7_CREATE_ORDER_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE: i32 = 102;
+
 /// The identifier of an LSPS7 channel extension order.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct LSPS7OrderId(pub String);
+
+impl Writeable for LSPS7OrderId {
+	fn write<W: lightning::util::ser::Writer>(
+		&self, writer: &mut W,
+	) -> Result<(), lightning::io::Error> {
+		self.0.write(writer)
+	}
+}
+
+impl Readable for LSPS7OrderId {
+	fn read<R: bitcoin::io::Read>(
+		reader: &mut R,
+	) -> Result<Self, lightning::ln::msgs::DecodeError> {
+		let inner = Readable::read(reader)?;
+		Ok(Self(inner))
+	}
+}
 
 /// An object representing the status of a channel extension order.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

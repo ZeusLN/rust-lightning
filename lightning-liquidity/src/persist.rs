@@ -13,6 +13,7 @@ use crate::events::{EventQueueDeserWrapper, LiquidityEvent};
 use crate::lsps1::peer_state::PeerState as LSPS1ServicePeerState;
 use crate::lsps2::service::PeerState as LSPS2ServicePeerState;
 use crate::lsps5::service::PeerState as LSPS5ServicePeerState;
+use crate::lsps7::peer_state::PeerState as LSPS7ServicePeerState;
 use crate::prelude::{new_hash_map, HashMap};
 use crate::sync::Mutex;
 
@@ -54,6 +55,11 @@ pub const LSPS2_SERVICE_PERSISTENCE_SECONDARY_NAMESPACE: &str = "lsps2_service";
 ///
 /// [`LSPS5ServiceHandler`]: crate::lsps5::service::LSPS5ServiceHandler
 pub const LSPS5_SERVICE_PERSISTENCE_SECONDARY_NAMESPACE: &str = "lsps5_service";
+
+/// The secondary namespace under which the [`LSPS7ServiceHandler`] data will be persisted.
+///
+/// [`LSPS7ServiceHandler`]: crate::lsps7::service::LSPS7ServiceHandler
+pub const LSPS7_SERVICE_PERSISTENCE_SECONDARY_NAMESPACE: &str = "lsps7_service";
 
 pub(crate) async fn read_event_queue<K: KVStore>(
 	kv_store: K,
@@ -112,6 +118,47 @@ pub(crate) async fn read_lsps1_service_peer_states<K: KVStore>(
 			lightning::io::Error::new(
 				lightning::io::ErrorKind::InvalidData,
 				"Failed to deserialize LSPS1 peer state",
+			)
+		})?;
+
+		let key = PublicKey::from_str(&stored_key).map_err(|_| {
+			lightning::io::Error::new(
+				lightning::io::ErrorKind::InvalidData,
+				"Failed to deserialize stored key entry",
+			)
+		})?;
+
+		res.insert(key, Mutex::new(peer_state));
+	}
+	Ok(res)
+}
+
+pub(crate) async fn read_lsps7_service_peer_states<K: KVStore>(
+	kv_store: K,
+) -> Result<HashMap<PublicKey, Mutex<LSPS7ServicePeerState>>, lightning::io::Error> {
+	let mut res = new_hash_map();
+
+	for stored_key in kv_store
+		.list(
+			LIQUIDITY_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+			LSPS7_SERVICE_PERSISTENCE_SECONDARY_NAMESPACE,
+		)
+		.await?
+	{
+		let mut reader = Cursor::new(
+			kv_store
+				.read(
+					LIQUIDITY_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+					LSPS7_SERVICE_PERSISTENCE_SECONDARY_NAMESPACE,
+					&stored_key,
+				)
+				.await?,
+		);
+
+		let peer_state = LSPS7ServicePeerState::read(&mut reader).map_err(|_| {
+			lightning::io::Error::new(
+				lightning::io::ErrorKind::InvalidData,
+				"Failed to deserialize LSPS7 peer state",
 			)
 		})?;
 

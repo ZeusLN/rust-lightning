@@ -9,7 +9,7 @@
 
 //! Contains bLIP-57 / LSPS7 event types
 
-use super::msgs::{LSPS7ExtendableChannel, LSPS7OrderId, LSPS7OrderState};
+use super::msgs::{LSPS7CreateOrderRequest, LSPS7ExtendableChannel, LSPS7OrderId, LSPS7OrderState};
 
 use crate::lsps0::ser::{LSPSDateTime, LSPSRequestId, LSPSResponseError};
 use crate::lsps1::msgs::LSPS1PaymentInfo;
@@ -156,5 +156,42 @@ pub enum LSPS7ClientEvent {
 		counterparty_node_id: PublicKey,
 		/// The error that was returned.
 		error: LSPSResponseError,
+	},
+}
+
+/// An event which a bLIP-57 / LSPS7 server should take some action in response to.
+///
+/// **Note:** These events will *not* be persisted across restarts. A pending request is dropped
+/// when its peer disconnects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LSPS7ServiceEvent {
+	/// A client asked which of its channels can be extended.
+	///
+	/// You must answer with [`LSPS7ServiceHandler::extendable_channels`], or turn the request
+	/// down with [`LSPS7ServiceHandler::reject_order`].
+	///
+	/// [`LSPS7ServiceHandler::extendable_channels`]: crate::lsps7::service::LSPS7ServiceHandler::extendable_channels
+	/// [`LSPS7ServiceHandler::reject_order`]: crate::lsps7::service::LSPS7ServiceHandler::reject_order
+	GetExtendableChannels {
+		/// An identifier that must be passed back with the answer.
+		request_id: LSPSRequestId,
+		/// The node id of the client.
+		counterparty_node_id: PublicKey,
+	},
+	/// A client wants to extend the lease of one of its channels.
+	///
+	/// Check the request against your records, then call
+	/// [`LSPS7ServiceHandler::send_payment_details`] with the channel and the payment details,
+	/// or turn the request down with [`LSPS7ServiceHandler::reject_order`].
+	///
+	/// [`LSPS7ServiceHandler::send_payment_details`]: crate::lsps7::service::LSPS7ServiceHandler::send_payment_details
+	/// [`LSPS7ServiceHandler::reject_order`]: crate::lsps7::service::LSPS7ServiceHandler::reject_order
+	RequestForPaymentDetails {
+		/// An identifier that must be passed back with the answer.
+		request_id: LSPSRequestId,
+		/// The node id of the client.
+		counterparty_node_id: PublicKey,
+		/// The extension requested.
+		request: LSPS7CreateOrderRequest,
 	},
 }
