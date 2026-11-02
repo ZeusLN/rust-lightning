@@ -1494,3 +1494,40 @@ fn lsps1_reject_create_order_sends_the_error() {
 		e => panic!("Unexpected event: {:?}", e),
 	}
 }
+
+#[test]
+fn lsps1_supported_options_can_change_at_runtime() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } =
+		setup_test_lsps1_nodes(nodes, out_of_band_test_options());
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps1_client_handler().unwrap();
+	let service_handler = service_node.liquidity_manager.lsps1_service_handler().unwrap();
+
+	let mut narrower = out_of_band_test_options();
+	narrower.min_channel_balance_sat = 500_000;
+	narrower.min_initial_lsp_balance_sat = 500_000;
+	service_handler.set_supported_options(narrower.clone());
+	assert_eq!(service_handler.config().supported_options, narrower);
+
+	// get_info answers with the new options...
+	client_handler.request_supported_options(service_node_id);
+	let request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(request, client_node_id).unwrap();
+	let response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
+			supported_options,
+			..
+		}) => assert_eq!(supported_options, narrower),
+		e => panic!("Unexpected event: {:?}", e),
+	}
+
+	// ...and orders are checked against them.
+	assert!(!service_handler.order_matches_options(&out_of_band_order_params()));
+}
