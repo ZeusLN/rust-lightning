@@ -28,7 +28,7 @@ use super::msgs::{
 	LSPS1_GET_ORDER_REQUEST_ORDER_NOT_FOUND_ERROR_CODE,
 };
 pub use super::peer_state::PaymentMethod;
-use super::peer_state::PeerState;
+use super::peer_state::{ChannelOrder, PeerState};
 use crate::message_queue::MessageQueue;
 
 use crate::events::EventQueue;
@@ -377,39 +377,19 @@ where
 	/// user didn't provide a `refund_onchain_address`. If you *require* onchain payments, you need
 	/// to call [`Self::onchain_payments_required`] to reject the request.
 	///
+	/// Returns the id of the new order, which the order's later state transitions
+	/// ([`Self::order_payment_received`] and the like) take.
+	///
 	/// [`LSPS1ServiceEvent::RequestForPaymentDetails`]: crate::lsps1::event::LSPS1ServiceEvent::RequestForPaymentDetails
 	pub async fn send_payment_details(
 		&self, request_id: LSPSRequestId, counterparty_node_id: PublicKey,
 		payment_details: LSPS1PaymentInfo,
-	) -> Result<(), APIError> {
+	) -> Result<LSPS1OrderId, APIError> {
 		let mut message_queue_notifier = self.pending_messages.notifier();
 		let mut should_persist = false;
+		let new_order_id;
 
-		if payment_details.bolt11.is_none()
-			&& payment_details.bolt12.is_none()
-			&& payment_details.onchain.is_none()
-		{
-			let err = "At least one payment option must be provided".to_string();
-			return Err(APIError::APIMisuseError { err });
-		}
-
-		if payment_details
-			.bolt11
-			.as_ref()
-			.is_some_and(|b| b.state != LSPS1PaymentState::ExpectPayment)
-			|| payment_details
-				.bolt12
-				.as_ref()
-				.is_some_and(|b| b.state != LSPS1PaymentState::ExpectPayment)
-			|| payment_details
-				.onchain
-				.as_ref()
-				.is_some_and(|o| o.state != LSPS1PaymentState::ExpectPayment)
-		{
-			return Err(APIError::APIMisuseError {
-				err: "All payment methods must start in ExpectPayment state".to_string(),
-			});
-		}
+		check_payment_details(&payment_details)?;
 
 		match self.per_peer_state.read().unwrap().get(&counterparty_node_id) {
 			Some(inner_state_lock) => {
@@ -441,6 +421,7 @@ where
 				match request {
 					LSPS1Request::CreateOrder(params) => {
 						let order_id = self.generate_order_id();
+						new_order_id = order_id.clone();
 						let created_at = LSPSDateTime::new_from_duration_since_epoch(
 							self.time_provider.duration_since_epoch(),
 						);
@@ -453,14 +434,7 @@ where
 						);
 						should_persist |= peer_state_lock.needs_persist();
 
-						let response = LSPS1Response::CreateOrder(LSPS1CreateOrderResponse {
-							order_id,
-							order_state: order.order_state(),
-							created_at: order.created_at.clone(),
-							payment: order.payment_details().clone(),
-							channel: order.channel_details().cloned(),
-							order: order.order_params,
-						});
+						let response = LSPS1Response::CreateOrder(order_response(order_id, &order));
 						let msg = LSPS1Message::Response(request_id, response).into();
 						message_queue_notifier.enqueue(&counterparty_node_id, msg);
 					},
@@ -496,7 +470,117 @@ where
 			})?;
 		}
 
-		Ok(())
+		Ok(new_order_id)
+	}
+
+	/// Returns whether `order` matches the options this LSP supports, the check a
+	/// `create_order` request must pass.
+	pub fn order_matches_options(&self, order: &LSPS1OrderParams) -> bool {
+		is_valid(order, &self.config.supported_options)
+	}
+
+	/// Creates an order for `counterparty_node_id` from a request that did not arrive as an
+	/// LSPS0 message, for example one received over HTTP.
+	///
+	/// The order goes through the same checks as a `create_order` request received from a peer
+	/// (supported options, per-peer and total limits, the refund address required for onchain
+	/// payments) and joins the same order book: the peer can query it with `get_order`, and the
+	/// LSP drives it with [`Self::order_payment_received`] and the like. No message is sent to the
+	/// peer; the response is returned for the caller to deliver.
+	///
+	/// Note that nothing here proves the request came from `counterparty_node_id`.
+	pub async fn create_order(
+		&self, counterparty_node_id: PublicKey, request: LSPS1CreateOrderRequest,
+		payment_details: LSPS1PaymentInfo,
+	) -> Result<LSPS1CreateOrderResponse, LSPS1CreateOrderError> {
+		check_payment_details(&payment_details).map_err(LSPS1CreateOrderError::APIMisuse)?;
+		if payment_details.onchain.is_some() && request.refund_onchain_address.is_none() {
+			// bLIP-51: 'LSP MUST disable on-chain payments if the client omits this field.'
+			let err = "Onchain payments must be disabled if no refund_onchain_address is set."
+				.to_string();
+			return Err(LSPS1CreateOrderError::APIMisuse(APIError::APIMisuseError { err }));
+		}
+		if !is_valid(&request.order, &self.config.supported_options) {
+			return Err(LSPS1CreateOrderError::Rejected(LSPSResponseError {
+				code: LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE,
+				message: "Order does not match options supported by LSP server".to_string(),
+				data: Some(format!("Supported options are {:?}", &self.config.supported_options)),
+			}));
+		}
+
+		let response = {
+			let mut outer_state_lock = self.per_peer_state.write().unwrap();
+			let num_peers = outer_state_lock.len();
+			let inner_state_entry = outer_state_lock.entry(counterparty_node_id);
+			if matches!(inner_state_entry, Entry::Vacant(_)) && num_peers >= MAX_TOTAL_PEERS {
+				return Err(LSPS1CreateOrderError::Rejected(LSPSResponseError {
+					code: LSPS0_CLIENT_REJECTED_ERROR_CODE,
+					message: "Reached maximum number of pending requests. Please try again later."
+						.to_string(),
+					data: None,
+				}));
+			}
+			let mut peer_state_lock =
+				inner_state_entry.or_insert(Mutex::new(PeerState::default())).lock().unwrap();
+			peer_state_lock.check_can_add_order().map_err(|e| {
+				LSPS1CreateOrderError::Rejected(LSPSResponseError {
+					code: LSPS0_CLIENT_REJECTED_ERROR_CODE,
+					message: format!("Failed to handle request due to: {}", e),
+					data: None,
+				})
+			})?;
+
+			let order_id = self.generate_order_id();
+			let created_at = LSPSDateTime::new_from_duration_since_epoch(
+				self.time_provider.duration_since_epoch(),
+			);
+			let order = peer_state_lock.new_order(
+				order_id.clone(),
+				request.order,
+				created_at,
+				payment_details,
+			);
+			order_response(order_id, &order)
+		};
+
+		self.persist_peer_state(counterparty_node_id).await.map_err(|e| {
+			LSPS1CreateOrderError::APIMisuse(APIError::APIMisuseError {
+				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+			})
+		})?;
+
+		Ok(response)
+	}
+
+	/// Looks up an order by id alone, whichever peer it belongs to, and returns that peer with
+	/// the order's current state, as a `get_order` response would carry it.
+	///
+	/// Orders the service has pruned (expired before payment, or failed and refunded with all
+	/// payment options expired) are not found.
+	pub fn get_order(
+		&self, order_id: &LSPS1OrderId,
+	) -> Option<(PublicKey, LSPS1CreateOrderResponse)> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		for (counterparty_node_id, inner_state_lock) in outer_state_lock.iter() {
+			let peer_state_lock = inner_state_lock.lock().unwrap();
+			if let Ok(order) = peer_state_lock.get_order(order_id) {
+				return Some((*counterparty_node_id, order_response(order_id.clone(), order)));
+			}
+		}
+		None
+	}
+
+	/// Returns every order the service holds, with the peer each belongs to.
+	pub fn list_orders(&self) -> Vec<(PublicKey, LSPS1CreateOrderResponse)> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		let mut orders = Vec::new();
+		for (counterparty_node_id, inner_state_lock) in outer_state_lock.iter() {
+			let peer_state_lock = inner_state_lock.lock().unwrap();
+			for (order_id, order) in peer_state_lock.orders() {
+				orders.push((*counterparty_node_id, order_response(order_id.clone(), order)));
+			}
+		}
+		orders
 	}
 
 	/// Used by LSP to inform a client that an order was rejected because the used token was invalid.
@@ -597,14 +681,7 @@ where
 					LightningError { err, action }
 				})?;
 
-				let response = LSPS1Response::GetOrder(LSPS1CreateOrderResponse {
-					order_id: params.order_id,
-					order: order.order_params.clone(),
-					order_state: order.order_state(),
-					created_at: order.created_at.clone(),
-					payment: order.payment_details().clone(),
-					channel: order.channel_details().cloned(),
-				});
+				let response = LSPS1Response::GetOrder(order_response(params.order_id, order));
 				let msg = LSPS1Message::Response(request_id, response).into();
 				message_queue_notifier.enqueue(&counterparty_node_id, msg);
 				Ok(())
@@ -834,7 +911,7 @@ where
 	pub fn send_payment_details(
 		&self, request_id: LSPSRequestId, counterparty_node_id: PublicKey,
 		payment_details: LSPS1PaymentInfo,
-	) -> Result<(), APIError> {
+	) -> Result<LSPS1OrderId, APIError> {
 		let mut fut = pin!(self.inner.send_payment_details(
 			request_id,
 			counterparty_node_id,
@@ -850,6 +927,49 @@ where
 				unreachable!("Should not be pending in a sync context");
 			},
 		}
+	}
+
+	/// Returns whether `order` matches the options this LSP supports.
+	///
+	/// Wraps [`LSPS1ServiceHandler::order_matches_options`].
+	pub fn order_matches_options(&self, order: &LSPS1OrderParams) -> bool {
+		self.inner.order_matches_options(order)
+	}
+
+	/// Creates an order from a request that did not arrive as an LSPS0 message.
+	///
+	/// Wraps [`LSPS1ServiceHandler::create_order`].
+	pub fn create_order(
+		&self, counterparty_node_id: PublicKey, request: LSPS1CreateOrderRequest,
+		payment_details: LSPS1PaymentInfo,
+	) -> Result<LSPS1CreateOrderResponse, LSPS1CreateOrderError> {
+		let mut fut = pin!(self.inner.create_order(counterparty_node_id, request, payment_details));
+
+		let mut waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&mut waker);
+		match fut.as_mut().poll(&mut ctx) {
+			task::Poll::Ready(result) => result,
+			task::Poll::Pending => {
+				// In a sync context, we can't wait for the future to complete.
+				unreachable!("Should not be pending in a sync context");
+			},
+		}
+	}
+
+	/// Looks up an order by id alone.
+	///
+	/// Wraps [`LSPS1ServiceHandler::get_order`].
+	pub fn get_order(
+		&self, order_id: &LSPS1OrderId,
+	) -> Option<(PublicKey, LSPS1CreateOrderResponse)> {
+		self.inner.get_order(order_id)
+	}
+
+	/// Returns every order the service holds.
+	///
+	/// Wraps [`LSPS1ServiceHandler::list_orders`].
+	pub fn list_orders(&self) -> Vec<(PublicKey, LSPS1CreateOrderResponse)> {
+		self.inner.list_orders()
 	}
 
 	/// Used by LSP to inform a client that an order was rejected because the used token was invalid.
@@ -929,6 +1049,54 @@ where
 				unreachable!("Should not be pending in a sync context");
 			},
 		}
+	}
+}
+
+/// Why [`LSPS1ServiceHandler::create_order`] did not create an order.
+#[derive(Debug, Clone)]
+pub enum LSPS1CreateOrderError {
+	/// The request was rejected; this is the error a `create_order` request received from a peer
+	/// would have been answered with.
+	Rejected(LSPSResponseError),
+	/// The call itself was wrong (for example, no payment option was given), or the new order
+	/// could not be persisted.
+	APIMisuse(APIError),
+}
+
+fn check_payment_details(payment_details: &LSPS1PaymentInfo) -> Result<(), APIError> {
+	if payment_details.bolt11.is_none()
+		&& payment_details.bolt12.is_none()
+		&& payment_details.onchain.is_none()
+	{
+		let err = "At least one payment option must be provided".to_string();
+		return Err(APIError::APIMisuseError { err });
+	}
+
+	if payment_details.bolt11.as_ref().is_some_and(|b| b.state != LSPS1PaymentState::ExpectPayment)
+		|| payment_details
+			.bolt12
+			.as_ref()
+			.is_some_and(|b| b.state != LSPS1PaymentState::ExpectPayment)
+		|| payment_details
+			.onchain
+			.as_ref()
+			.is_some_and(|o| o.state != LSPS1PaymentState::ExpectPayment)
+	{
+		return Err(APIError::APIMisuseError {
+			err: "All payment methods must start in ExpectPayment state".to_string(),
+		});
+	}
+	Ok(())
+}
+
+fn order_response(order_id: LSPS1OrderId, order: &ChannelOrder) -> LSPS1CreateOrderResponse {
+	LSPS1CreateOrderResponse {
+		order_id,
+		order: order.order_params.clone(),
+		order_state: order.order_state(),
+		created_at: order.created_at.clone(),
+		payment: order.payment_details().clone(),
+		channel: order.channel_details().cloned(),
 	}
 }
 

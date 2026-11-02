@@ -30,10 +30,14 @@ pub(crate) const LSPS1_GET_INFO_METHOD_NAME: &str = "lsps1.get_info";
 pub(crate) const LSPS1_CREATE_ORDER_METHOD_NAME: &str = "lsps1.create_order";
 pub(crate) const LSPS1_GET_ORDER_METHOD_NAME: &str = "lsps1.get_order";
 
-pub(crate) const _LSPS1_CREATE_ORDER_REQUEST_INVALID_PARAMS_ERROR_CODE: i32 = -32602;
-pub(crate) const LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE: i32 = 100;
-pub(crate) const LSPS1_GET_ORDER_REQUEST_ORDER_NOT_FOUND_ERROR_CODE: i32 = 101;
-pub(crate) const LSPS1_CREATE_ORDER_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE: i32 = 102;
+/// Error code for a `create_order` request with invalid parameters.
+pub const LSPS1_CREATE_ORDER_REQUEST_INVALID_PARAMS_ERROR_CODE: i32 = -32602;
+/// Error code for a `create_order` request that does not match the LSP's options.
+pub const LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE: i32 = 100;
+/// Error code for a `get_order` request naming an order the LSP does not know.
+pub const LSPS1_GET_ORDER_REQUEST_ORDER_NOT_FOUND_ERROR_CODE: i32 = 101;
+/// Error code for a `create_order` request with an unrecognized or stale token.
+pub const LSPS1_CREATE_ORDER_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE: i32 = 102;
 
 /// The identifier of an order.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]

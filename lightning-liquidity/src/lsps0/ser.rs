@@ -60,7 +60,8 @@ pub(crate) const JSONRPC_INVALID_MESSAGE_ERROR_MESSAGE: &str = "parse error";
 pub(crate) const JSONRPC_INTERNAL_ERROR_ERROR_CODE: i32 = -32603;
 pub(crate) const JSONRPC_INTERNAL_ERROR_ERROR_MESSAGE: &str = "Internal error";
 
-pub(crate) const LSPS0_CLIENT_REJECTED_ERROR_CODE: i32 = 1;
+/// Error code for a request the LSP rejects because of who the client is.
+pub const LSPS0_CLIENT_REJECTED_ERROR_CODE: i32 = 1;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LSPSMethod {
