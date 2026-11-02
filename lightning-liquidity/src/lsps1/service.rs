@@ -618,6 +618,41 @@ where
 		}
 	}
 
+	/// Used by LSP to turn down a pending `create_order` request with the given error, for
+	/// reasons the other rejections don't cover: for example [`LSPS0_CLIENT_REJECTED_ERROR_CODE`]
+	/// for a client the LSP won't sell to, or
+	/// [`LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE`] for an order outside limits the
+	/// options can't express.
+	///
+	/// Should be called in response to receiving a [`LSPS1ServiceEvent::RequestForPaymentDetails`]
+	/// event.
+	///
+	/// [`LSPS1ServiceEvent::RequestForPaymentDetails`]: crate::lsps1::event::LSPS1ServiceEvent::RequestForPaymentDetails
+	/// [`LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE`]: super::msgs::LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE
+	pub fn reject_create_order(
+		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId, error: LSPSResponseError,
+	) -> Result<(), APIError> {
+		let mut message_queue_notifier = self.pending_messages.notifier();
+
+		match self.per_peer_state.read().unwrap().get(&counterparty_node_id) {
+			Some(inner_state_lock) => {
+				let mut peer_state_lock = inner_state_lock.lock().unwrap();
+				peer_state_lock.remove_request(&request_id).map_err(|e| {
+					let err = format!("Failed to send response due to: {}", e);
+					APIError::APIMisuseError { err }
+				})?;
+
+				let response = LSPS1Response::CreateOrderError(error);
+				let msg = LSPS1Message::Response(request_id, response).into();
+				message_queue_notifier.enqueue(&counterparty_node_id, msg);
+				Ok(())
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("No state for the counterparty exists: {}", counterparty_node_id),
+			}),
+		}
+	}
+
 	/// Used by LSP to inform a client that an order was rejected because they require onchain
 	/// payments and the client didn't provide a `refund_onchain_address`.
 	///
@@ -979,6 +1014,15 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 	) -> Result<(), APIError> {
 		self.inner.invalid_token_provided(counterparty_node_id, request_id)
+	}
+
+	/// Used by LSP to turn down a pending `create_order` request with the given error.
+	///
+	/// Wraps [`LSPS1ServiceHandler::reject_create_order`].
+	pub fn reject_create_order(
+		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId, error: LSPSResponseError,
+	) -> Result<(), APIError> {
+		self.inner.reject_create_order(counterparty_node_id, request_id, error)
 	}
 
 	/// Used by LSP to inform a client that an order was rejected because they require onchain

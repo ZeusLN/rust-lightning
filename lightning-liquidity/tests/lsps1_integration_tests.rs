@@ -8,7 +8,7 @@ use common::{get_lsps_message, LSPSNodes};
 use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
-use lightning_liquidity::lsps0::ser::LSPS0_CLIENT_REJECTED_ERROR_CODE;
+use lightning_liquidity::lsps0::ser::{LSPSResponseError, LSPS0_CLIENT_REJECTED_ERROR_CODE};
 use lightning_liquidity::lsps1::client::LSPS1ClientConfig;
 use lightning_liquidity::lsps1::event::LSPS1ClientEvent;
 use lightning_liquidity::lsps1::event::LSPS1ServiceEvent;
@@ -1446,4 +1446,51 @@ fn lsps1_out_of_band_order_checks() {
 		r => panic!("Unexpected result: {:?}", r),
 	}
 	assert_eq!(service_handler.list_orders().len(), MAX_PENDING_REQUESTS_PER_PEER);
+}
+
+#[test]
+fn lsps1_reject_create_order_sends_the_error() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } =
+		setup_test_lsps1_nodes(nodes, out_of_band_test_options());
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps1_client_handler().unwrap();
+	let service_handler = service_node.liquidity_manager.lsps1_service_handler().unwrap();
+
+	client_handler.create_order(&service_node_id, out_of_band_order_params(), None);
+	let create_order = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(create_order, client_node_id).unwrap();
+	let request_id = match service_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS1Service(LSPS1ServiceEvent::RequestForPaymentDetails {
+			request_id,
+			..
+		}) => request_id,
+		e => panic!("Unexpected event: {:?}", e),
+	};
+
+	let error = LSPSResponseError {
+		code: LSPS0_CLIENT_REJECTED_ERROR_CODE,
+		message: "LSP unavailable in your country".to_string(),
+		data: None,
+	};
+	service_handler.reject_create_order(client_node_id, request_id.clone(), error.clone()).unwrap();
+	// The request is gone.
+	assert!(service_handler
+		.reject_create_order(client_node_id, request_id, error.clone())
+		.is_err());
+	assert!(service_handler.list_orders().is_empty());
+
+	let response = get_lsps_message!(service_node, client_node_id);
+	let _ = client_node.liquidity_manager.handle_custom_message(response, service_node_id);
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS1Client(LSPS1ClientEvent::OrderRequestFailed {
+			error: received,
+			..
+		}) => assert_eq!(received, error),
+		e => panic!("Unexpected event: {:?}", e),
+	}
 }
