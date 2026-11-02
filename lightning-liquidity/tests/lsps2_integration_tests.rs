@@ -65,6 +65,7 @@ fn build_lsps2_configs() -> ([u8; 32], LiquidityServiceConfig, LiquidityClientCo
 		lsps1_service_config: None,
 		lsps2_service_config: Some(lsps2_service_config),
 		lsps5_service_config: None,
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 
@@ -1336,6 +1337,7 @@ fn lsps2_service_handler_persistence_across_restarts() {
 		lsps1_service_config: None,
 		lsps2_service_config: Some(LSPS2ServiceConfig { promise_secret }),
 		lsps5_service_config: None,
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 	let time_provider: Arc<dyn TimeProvider + Send + Sync> = Arc::new(DefaultTimeProvider);

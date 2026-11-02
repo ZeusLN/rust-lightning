@@ -48,6 +48,7 @@ fn build_lsps1_configs(
 		lsps1_service_config: Some(lsps1_service_config),
 		lsps2_service_config: None,
 		lsps5_service_config: None,
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 
@@ -296,6 +297,7 @@ fn lsps1_service_handler_persistence_across_restarts() {
 		}),
 		lsps2_service_config: None,
 		lsps5_service_config: None,
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 	let time_provider: Arc<dyn TimeProvider + Send + Sync> = Arc::new(DefaultTimeProvider);
@@ -927,6 +929,7 @@ fn lsps1_expired_orders_are_pruned_and_not_persisted() {
 		}),
 		lsps2_service_config: None,
 		lsps5_service_config: None,
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 	let time_provider: Arc<dyn TimeProvider + Send + Sync> = Arc::new(DefaultTimeProvider);

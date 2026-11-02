@@ -52,6 +52,7 @@ fn list_protocols_integration_test() {
 		lsps1_service_config: Some(lsps1_service_config),
 		lsps2_service_config: Some(lsps2_service_config),
 		lsps5_service_config: Some(lsps5_service_config),
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 

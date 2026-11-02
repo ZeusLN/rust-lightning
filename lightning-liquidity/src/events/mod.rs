@@ -45,6 +45,8 @@ pub enum LiquidityEvent {
 	LSPS5Service(lsps5::event::LSPS5ServiceEvent),
 	/// An LSPS7 (Channel Lease Extension) client event.
 	LSPS7Client(lsps7::event::LSPS7ClientEvent),
+	/// An LSPS7 (Channel Lease Extension) server event.
+	LSPS7Service(lsps7::event::LSPS7ServiceEvent),
 }
 
 impl From<lsps0::event::LSPS0ClientEvent> for LiquidityEvent {
@@ -92,5 +94,11 @@ impl From<lsps5::event::LSPS5ServiceEvent> for LiquidityEvent {
 impl From<lsps7::event::LSPS7ClientEvent> for LiquidityEvent {
 	fn from(event: lsps7::event::LSPS7ClientEvent) -> Self {
 		Self::LSPS7Client(event)
+	}
+}
+
+impl From<lsps7::event::LSPS7ServiceEvent> for LiquidityEvent {
+	fn from(event: lsps7::event::LSPS7ServiceEvent) -> Self {
+		Self::LSPS7Service(event)
 	}
 }

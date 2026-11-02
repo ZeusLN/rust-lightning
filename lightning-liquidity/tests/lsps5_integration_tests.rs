@@ -55,6 +55,7 @@ pub(crate) fn lsps5_test_setup_with_kv_stores<'a, 'b, 'c>(
 		lsps1_service_config: None,
 		lsps2_service_config: None,
 		lsps5_service_config: Some(lsps5_service_config),
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 
@@ -241,6 +242,7 @@ pub(crate) fn lsps5_lsps2_test_setup<'a, 'b, 'c>(
 		lsps1_service_config: None,
 		lsps2_service_config: Some(lsps2_service_config),
 		lsps5_service_config: Some(lsps5_service_config),
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 
@@ -1557,6 +1559,7 @@ fn lsps5_service_handler_persistence_across_restarts() {
 		lsps1_service_config: None,
 		lsps2_service_config: None,
 		lsps5_service_config: Some(LSPS5ServiceConfig::default()),
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 	let time_provider: Arc<dyn TimeProvider + Send + Sync> = Arc::new(DefaultTimeProvider);
@@ -1772,6 +1775,7 @@ fn lsps5_service_persist_resets_in_flight_counter_on_io_error() {
 		lsps1_service_config: None,
 		lsps2_service_config: None,
 		lsps5_service_config: Some(LSPS5ServiceConfig::default()),
+		lsps7_service_config: None,
 		advertise_service: true,
 	};
 	let client_config = LiquidityClientConfig {
