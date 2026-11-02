@@ -83,7 +83,7 @@ pub struct LSPS1ServiceHandler<
 	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
 	persistence_in_flight: AtomicUsize,
 	time_provider: TP,
-	config: LSPS1ServiceConfig,
+	config: RwLock<LSPS1ServiceConfig>,
 }
 
 impl<ES: EntropySource, CM: Deref + Clone, K: KVStore + Clone, TP: Deref + Clone>
@@ -107,13 +107,19 @@ where
 			per_peer_state: RwLock::new(per_peer_state),
 			persistence_in_flight: AtomicUsize::new(0),
 			time_provider,
-			config,
+			config: RwLock::new(config),
 		}
 	}
 
-	/// Returns a reference to the used config.
-	pub fn config(&self) -> &LSPS1ServiceConfig {
-		&self.config
+	/// Returns the config in use.
+	pub fn config(&self) -> LSPS1ServiceConfig {
+		self.config.read().unwrap().clone()
+	}
+
+	/// Replaces the options the LSP supports. `get_info` answers with them, and orders are checked
+	/// against them, from the next request on; existing orders are unaffected.
+	pub fn set_supported_options(&self, supported_options: LSPS1Options) {
+		self.config.write().unwrap().supported_options = supported_options;
 	}
 
 	/// Returns whether the peer currently has any active LSPS1 order flows.
@@ -285,7 +291,7 @@ where
 		let mut message_queue_notifier = self.pending_messages.notifier();
 
 		let response = LSPS1Response::GetInfo(LSPS1GetInfoResponse {
-			options: self.config.supported_options.clone(),
+			options: self.config.read().unwrap().supported_options.clone(),
 		});
 
 		let msg = LSPS1Message::Response(request_id, response).into();
@@ -300,11 +306,12 @@ where
 		let mut message_queue_notifier = self.pending_messages.notifier();
 		let event_queue_notifier = self.pending_events.notifier();
 
-		if !is_valid(&params.order, &self.config.supported_options) {
+		let supported_options = self.config.read().unwrap().supported_options.clone();
+		if !is_valid(&params.order, &supported_options) {
 			let response = LSPS1Response::CreateOrderError(LSPSResponseError {
 				code: LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE,
 				message: "Order does not match options supported by LSP server".to_string(),
-				data: Some(format!("Supported options are {:?}", &self.config.supported_options)),
+				data: Some(format!("Supported options are {:?}", &supported_options)),
 			});
 			let msg = LSPS1Message::Response(request_id, response).into();
 			message_queue_notifier.enqueue(counterparty_node_id, msg);
@@ -476,7 +483,7 @@ where
 	/// Returns whether `order` matches the options this LSP supports, the check a
 	/// `create_order` request must pass.
 	pub fn order_matches_options(&self, order: &LSPS1OrderParams) -> bool {
-		is_valid(order, &self.config.supported_options)
+		is_valid(order, &self.config.read().unwrap().supported_options)
 	}
 
 	/// Creates an order for `counterparty_node_id` from a request that did not arrive as an
@@ -500,11 +507,12 @@ where
 				.to_string();
 			return Err(LSPS1CreateOrderError::APIMisuse(APIError::APIMisuseError { err }));
 		}
-		if !is_valid(&request.order, &self.config.supported_options) {
+		let supported_options = self.config.read().unwrap().supported_options.clone();
+		if !is_valid(&request.order, &supported_options) {
 			return Err(LSPS1CreateOrderError::Rejected(LSPSResponseError {
 				code: LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE,
 				message: "Order does not match options supported by LSP server".to_string(),
-				data: Some(format!("Supported options are {:?}", &self.config.supported_options)),
+				data: Some(format!("Supported options are {:?}", &supported_options)),
 			}));
 		}
 
@@ -933,11 +941,18 @@ where
 		Self { inner }
 	}
 
-	/// Returns a reference to the used config.
+	/// Returns the config in use.
 	///
 	/// Wraps [`LSPS1ServiceHandler::config`].
-	pub fn config(&self) -> &LSPS1ServiceConfig {
-		&self.inner.config
+	pub fn config(&self) -> LSPS1ServiceConfig {
+		self.inner.config()
+	}
+
+	/// Replaces the options the LSP supports.
+	///
+	/// Wraps [`LSPS1ServiceHandler::set_supported_options`].
+	pub fn set_supported_options(&self, supported_options: LSPS1Options) {
+		self.inner.set_supported_options(supported_options)
 	}
 
 	/// Used by LSP to send response containing details regarding the channel fees and payment information.
