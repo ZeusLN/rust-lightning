@@ -352,6 +352,19 @@ impl PeerState {
 		Ok(())
 	}
 
+	/// Whether a new order may be added outside of a pending request, under the same
+	/// per-peer limit [`Self::register_request`] enforces.
+	pub(super) fn check_can_add_order(&self) -> Result<(), PeerStateError> {
+		if self.pending_requests_and_unpaid_orders() >= MAX_PENDING_REQUESTS_PER_PEER {
+			return Err(PeerStateError::TooManyPendingRequests);
+		}
+		Ok(())
+	}
+
+	pub(super) fn orders(&self) -> impl Iterator<Item = (&LSPS1OrderId, &ChannelOrder)> {
+		self.outbound_channels_by_order_id.iter()
+	}
+
 	pub(super) fn get_request(
 		&self, request_id: &LSPSRequestId,
 	) -> Result<&LSPS1Request, PeerStateError> {

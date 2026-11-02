@@ -8,14 +8,18 @@ use common::{get_lsps_message, LSPSNodes};
 use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
+use lightning_liquidity::lsps0::ser::LSPS0_CLIENT_REJECTED_ERROR_CODE;
 use lightning_liquidity::lsps1::client::LSPS1ClientConfig;
 use lightning_liquidity::lsps1::event::LSPS1ClientEvent;
 use lightning_liquidity::lsps1::event::LSPS1ServiceEvent;
 use lightning_liquidity::lsps1::msgs::{
-	LSPS1ChannelInfo, LSPS1OnchainPaymentInfo, LSPS1Options, LSPS1OrderParams, LSPS1PaymentInfo,
-	LSPS1PaymentState,
+	LSPS1ChannelInfo, LSPS1CreateOrderRequest, LSPS1OnchainPaymentInfo, LSPS1Options,
+	LSPS1OrderParams, LSPS1OrderState, LSPS1PaymentInfo, LSPS1PaymentState,
+	LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE,
 };
-use lightning_liquidity::lsps1::service::{LSPS1ServiceConfig, PaymentMethod};
+use lightning_liquidity::lsps1::service::{
+	LSPS1CreateOrderError, LSPS1ServiceConfig, PaymentMethod,
+};
 use lightning_liquidity::utils::time::DefaultTimeProvider;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityManagerSync, LiquidityServiceConfig};
 
@@ -1232,4 +1236,211 @@ fn max_pending_requests_per_peer_rejected() {
 	} else {
 		panic!("Expected LSPS1ClientEvent::OrderRequestFailed event");
 	}
+}
+
+fn out_of_band_test_options() -> LSPS1Options {
+	LSPS1Options {
+		min_required_channel_confirmations: 0,
+		min_funding_confirms_within_blocks: 6,
+		supports_zero_channel_reserve: true,
+		max_channel_expiry_blocks: 144,
+		min_initial_client_balance_sat: 0,
+		max_initial_client_balance_sat: 100_000_000,
+		min_initial_lsp_balance_sat: 100_000,
+		max_initial_lsp_balance_sat: 100_000_000,
+		min_channel_balance_sat: 100_000,
+		max_channel_balance_sat: 100_000_000,
+	}
+}
+
+fn out_of_band_order_params() -> LSPS1OrderParams {
+	LSPS1OrderParams {
+		lsp_balance_sat: 100_000,
+		client_balance_sat: 0,
+		required_channel_confirmations: 0,
+		funding_confirms_within_blocks: 6,
+		channel_expiry_blocks: 144,
+		token: None,
+		announce_channel: false,
+	}
+}
+
+fn test_refund_address() -> Address {
+	Address::from_str("bc1p5uvtaxzkjwvey2tfy49k5vtqfpjmrgm09cvs88ezyy8h2zv7jhas9tu4yr")
+		.unwrap()
+		.assume_checked()
+}
+
+fn test_onchain_payment_info() -> LSPS1PaymentInfo {
+	let json_str = r#"{
+		"state": "EXPECT_PAYMENT",
+		"expires_at": "2035-01-01T00:00:00Z",
+		"fee_total_sat": "9999",
+		"order_total_sat": "9999",
+		"address": "bc1p5uvtaxzkjwvey2tfy49k5vtqfpjmrgm09cvs88ezyy8h2zv7jhas9tu4yr",
+		"min_onchain_payment_confirmations": 1,
+		"min_fee_for_0conf": 253
+	}"#;
+	let onchain: LSPS1OnchainPaymentInfo = serde_json::from_str(json_str).unwrap();
+	LSPS1PaymentInfo { bolt11: None, bolt12: None, onchain: Some(onchain) }
+}
+
+#[test]
+fn lsps1_send_payment_details_returns_order_id() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } =
+		setup_test_lsps1_nodes(nodes, out_of_band_test_options());
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps1_client_handler().unwrap();
+	let service_handler = service_node.liquidity_manager.lsps1_service_handler().unwrap();
+
+	client_handler.create_order(
+		&service_node_id,
+		out_of_band_order_params(),
+		Some(test_refund_address()),
+	);
+	let create_order = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(create_order, client_node_id).unwrap();
+	let request_id = match service_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS1Service(LSPS1ServiceEvent::RequestForPaymentDetails {
+			request_id,
+			..
+		}) => request_id,
+		e => panic!("Unexpected event: {:?}", e),
+	};
+
+	let service_order_id = service_handler
+		.send_payment_details(request_id, client_node_id, test_onchain_payment_info())
+		.unwrap();
+
+	let response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS1Client(LSPS1ClientEvent::OrderCreated { order_id, .. }) => {
+			assert_eq!(order_id, service_order_id);
+		},
+		e => panic!("Unexpected event: {:?}", e),
+	}
+
+	// The LSP can drive the order with the id it was given.
+	service_handler
+		.order_payment_received(client_node_id, service_order_id, PaymentMethod::Onchain)
+		.unwrap();
+}
+
+#[test]
+fn lsps1_out_of_band_order_joins_order_book() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } =
+		setup_test_lsps1_nodes(nodes, out_of_band_test_options());
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps1_client_handler().unwrap();
+	let service_handler = service_node.liquidity_manager.lsps1_service_handler().unwrap();
+
+	let request = LSPS1CreateOrderRequest {
+		order: out_of_band_order_params(),
+		refund_onchain_address: Some(test_refund_address()),
+	};
+	assert!(service_handler.order_matches_options(&request.order));
+	let created =
+		service_handler.create_order(client_node_id, request, test_onchain_payment_info()).unwrap();
+	assert_eq!(created.order_state, LSPS1OrderState::Created);
+	assert_eq!(created.order, out_of_band_order_params());
+
+	// Nothing is sent to the peer, and no event is raised.
+	assert!(service_node.liquidity_manager.get_and_clear_pending_msg().is_empty());
+	assert!(service_node.liquidity_manager.next_event().is_none());
+
+	let (owner, found) = service_handler.get_order(&created.order_id).unwrap();
+	assert_eq!(owner, client_node_id);
+	assert_eq!(found, created);
+	let listed = service_handler.list_orders();
+	assert_eq!(listed, vec![(client_node_id, created.clone())]);
+	assert!(service_handler.get_order(&LSPS1OrderId("unknown".to_string())).is_none());
+
+	// The LSP drives the order with the usual calls.
+	service_handler
+		.order_payment_received(client_node_id, created.order_id.clone(), PaymentMethod::Onchain)
+		.unwrap();
+	let (_, paid) = service_handler.get_order(&created.order_id).unwrap();
+	assert_eq!(paid.payment.onchain.unwrap().state, LSPS1PaymentState::Hold);
+
+	// The peer finds the order over LSPS0.
+	client_handler.check_order_status(&service_node_id, created.order_id.clone());
+	let check_order = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(check_order, client_node_id).unwrap();
+	let order_response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(order_response, service_node_id).unwrap();
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS1Client(LSPS1ClientEvent::OrderStatus {
+			order_id, payment, ..
+		}) => {
+			assert_eq!(order_id, created.order_id);
+			assert_eq!(payment.onchain.unwrap().state, LSPS1PaymentState::Hold);
+		},
+		e => panic!("Unexpected event: {:?}", e),
+	}
+}
+
+#[test]
+fn lsps1_out_of_band_order_checks() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let LSPSNodes { service_node, client_node } =
+		setup_test_lsps1_nodes(nodes, out_of_band_test_options());
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps1_service_handler().unwrap();
+
+	// Outside the supported options: rejected with the option-mismatch code.
+	let mut too_small = out_of_band_order_params();
+	too_small.lsp_balance_sat = 1;
+	assert!(!service_handler.order_matches_options(&too_small));
+	let request = LSPS1CreateOrderRequest {
+		order: too_small,
+		refund_onchain_address: Some(test_refund_address()),
+	};
+	match service_handler.create_order(client_node_id, request, test_onchain_payment_info()) {
+		Err(LSPS1CreateOrderError::Rejected(e)) => {
+			assert_eq!(e.code, LSPS1_CREATE_ORDER_REQUEST_OPTION_MISMATCH_ERROR_CODE)
+		},
+		r => panic!("Unexpected result: {:?}", r),
+	}
+
+	// Onchain payment without a refund address is a misuse, as in send_payment_details.
+	let request =
+		LSPS1CreateOrderRequest { order: out_of_band_order_params(), refund_onchain_address: None };
+	match service_handler.create_order(client_node_id, request, test_onchain_payment_info()) {
+		Err(LSPS1CreateOrderError::APIMisuse(_)) => {},
+		r => panic!("Unexpected result: {:?}", r),
+	}
+
+	// The per-peer limit on unpaid orders applies.
+	for _ in 0..MAX_PENDING_REQUESTS_PER_PEER {
+		let request = LSPS1CreateOrderRequest {
+			order: out_of_band_order_params(),
+			refund_onchain_address: Some(test_refund_address()),
+		};
+		service_handler.create_order(client_node_id, request, test_onchain_payment_info()).unwrap();
+	}
+	let request = LSPS1CreateOrderRequest {
+		order: out_of_band_order_params(),
+		refund_onchain_address: Some(test_refund_address()),
+	};
+	match service_handler.create_order(client_node_id, request, test_onchain_payment_info()) {
+		Err(LSPS1CreateOrderError::Rejected(e)) => {
+			assert_eq!(e.code, LSPS0_CLIENT_REJECTED_ERROR_CODE)
+		},
+		r => panic!("Unexpected result: {:?}", r),
+	}
+	assert_eq!(service_handler.list_orders().len(), MAX_PENDING_REQUESTS_PER_PEER);
 }
