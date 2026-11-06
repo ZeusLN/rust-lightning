@@ -26,7 +26,7 @@ use core::str::FromStr;
 use core::task;
 
 use crate::prelude::*;
-use crate::{io, log_error};
+use crate::{io, log_error, log_warn};
 
 use crate::chain;
 use crate::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
@@ -915,6 +915,10 @@ fn poll_sync_future<F: Future>(future: F) -> F::Output {
 /// Channel state is reconstructed by loading all stored monitors, along with any stored
 /// updates for them, using [`MonitorUpdatingPersister::read_all_channel_monitors_with_updates`].
 ///
+/// Updates are applied in order up to the first missing `update_id`. Any updates after it were
+/// never completed and are removed from the store while reading, so channel state should only be
+/// read while no channel monitor writes are in progress, i.e. on startup.
+///
 /// # Pruning stale channel updates
 ///
 /// Stale updates are pruned when the consolidation threshold is reached according to `maximum_pending_updates`.
@@ -1382,12 +1386,37 @@ impl<
 			Some(res) => res,
 			None => return Ok(None),
 		};
+		const LEGACY_CLOSED_CHANNEL_UPDATE_ID: u64 = u64::MAX;
 		let current_update_id = monitor.get_latest_update_id();
 		let updates: Result<Vec<_>, _> =
 			list_res?.into_iter().map(|name| UpdateName::new(name)).collect();
 		let mut updates = updates?;
 		updates.sort_unstable();
-		let updates_to_load = updates.iter().filter(|update| update.0 > current_update_id);
+		let first_newer_update = updates.partition_point(|update| update.0 <= current_update_id);
+		let mut newer_updates = &updates[first_newer_update..];
+		// Pre-0.1 LDK used `u64::MAX` for post-close updates, which `update_monitor` accepts
+		// regardless of the monitor's current `update_id`. Being the largest id, it sorts last.
+		let mut legacy_closed_update = None;
+		if let Some((last, rest)) = newer_updates.split_last() {
+			if last.0 == LEGACY_CLOSED_CHANNEL_UPDATE_ID {
+				legacy_closed_update = Some(last);
+				newer_updates = rest;
+			}
+		}
+		// A full monitor write and the updates that follow it are written to different keys, so
+		// they may complete in any order. If we stopped before the full monitor write for update N
+		// completed, updates after N may be stored while N, which never gets its own update entry,
+		// is not. The `ChainMonitor` doesn't report an update as completed until all prior updates
+		// have completed, so nothing after such a gap was relied upon, and the `ChannelManager`
+		// will replay any of it that it still needs. Thus, we only apply updates up to the first
+		// gap and remove the rest, so they can't be applied on top of a later full monitor write.
+		let contiguous_len = newer_updates
+			.iter()
+			.enumerate()
+			.take_while(|(idx, update)| update.0 - current_update_id == *idx as u64 + 1)
+			.count();
+		let (contiguous_updates, orphaned_updates) = newer_updates.split_at(contiguous_len);
+		let updates_to_load = contiguous_updates.iter().chain(legacy_closed_update);
 		let mut update_futures = Vec::with_capacity(updates_to_load.clone().count());
 		for update_name in updates_to_load {
 			update_futures.push(ResultFuture::Pending(Box::pin(async move {
@@ -1408,6 +1437,20 @@ impl<
 				);
 				io::Error::new(io::ErrorKind::Other, "Monitor update failed")
 			})?;
+		}
+		if let Some(first_orphaned_update) = orphaned_updates.first() {
+			log_warn!(
+				self.logger,
+				"Removing {} ChannelMonitorUpdate(s) for monitor {}, starting at update {}, as update {} is missing",
+				orphaned_updates.len(),
+				monitor_key,
+				first_orphaned_update.as_str(),
+				current_update_id + contiguous_len as u64 + 1,
+			);
+			let primary = CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE;
+			for update_name in orphaned_updates {
+				self.kv_store.remove(primary, monitor_key, update_name.as_str(), false).await?;
+			}
 		}
 		Ok(Some((best_block, monitor)))
 	}
@@ -2509,6 +2552,102 @@ mod tests {
 		)
 		.unwrap()
 		.is_empty());
+	}
+
+	// A full monitor write and the updates following it may complete in any order, so after a
+	// crash the stored updates may have a gap. Reading the monitor should apply the updates before
+	// the gap and remove the ones after it, rather than panicking on out-of-order updates.
+	#[test]
+	fn read_stops_at_update_gap() {
+		let max_pending_updates = 7;
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let kv_store = TestStore::new(false);
+		let persister = MonitorUpdatingPersister::new(
+			&kv_store,
+			&chanmon_cfgs[0].logger,
+			max_pending_updates,
+			&chanmon_cfgs[0].keys_manager,
+			&chanmon_cfgs[0].keys_manager,
+			&chanmon_cfgs[0].tx_broadcaster,
+			&chanmon_cfgs[0].fee_estimator,
+		);
+		let mut node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let chain_mon_0 = test_utils::TestChainMonitor::new(
+			Some(&chanmon_cfgs[0].chain_source),
+			&chanmon_cfgs[0].tx_broadcaster,
+			&chanmon_cfgs[0].logger,
+			&chanmon_cfgs[0].fee_estimator,
+			&persister,
+			&chanmon_cfgs[0].keys_manager,
+		);
+		node_cfgs[0].chain_monitor = chain_mon_0;
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+		let _ = create_announced_chan_between_nodes(&nodes, 0, 1);
+
+		// Returns the stored full monitor's `update_id` and the ids of the stored updates above it.
+		let stored_state = |monitor_name: &MonitorName| {
+			let monitor_key = monitor_name.to_string();
+			let (_, stored_monitor) =
+				poll_sync_future(persister.0 .0.maybe_read_monitor(monitor_name, &monitor_key))
+					.unwrap()
+					.unwrap();
+			let stored_update_id = stored_monitor.get_latest_update_id();
+			let mut update_ids: Vec<u64> = KVStoreSync::list(
+				&kv_store,
+				CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
+				&monitor_key,
+			)
+			.unwrap()
+			.into_iter()
+			.map(|name| UpdateName::new(name).unwrap().0)
+			.filter(|id| *id > stored_update_id)
+			.collect();
+			update_ids.sort_unstable();
+			(stored_update_id, update_ids)
+		};
+
+		// We need at least three updates stored after the full monitor: one to apply, one to drop
+		// to create the gap, and one after the gap.
+		let monitor_name = {
+			let persisted_chan_data = persister.read_all_channel_monitors_with_updates().unwrap();
+			assert_eq!(persisted_chan_data.len(), 1);
+			persisted_chan_data[0].1.persistence_key()
+		};
+		let mut payments = 0;
+		let (stored_update_id, update_ids) = loop {
+			send_payment(&nodes[0], &vec![&nodes[1]][..], 1_000_000);
+			payments += 1;
+			let (stored_update_id, update_ids) = stored_state(&monitor_name);
+			if update_ids.len() >= 3 {
+				break (stored_update_id, update_ids);
+			}
+			assert!(payments < 2 * max_pending_updates);
+		};
+		let expected_ids: Vec<u64> =
+			(stored_update_id + 1..=stored_update_id + update_ids.len() as u64).collect();
+		assert_eq!(update_ids, expected_ids);
+
+		let monitor_key = monitor_name.to_string();
+		let missing_update = UpdateName::from(update_ids[1]);
+		KVStoreSync::remove(
+			&kv_store,
+			CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
+			&monitor_key,
+			missing_update.as_str(),
+			false,
+		)
+		.unwrap();
+
+		let persisted_chan_data = persister.read_all_channel_monitors_with_updates().unwrap();
+		assert_eq!(persisted_chan_data.len(), 1);
+		assert_eq!(persisted_chan_data[0].1.get_latest_update_id(), update_ids[0]);
+
+		// The updates after the gap were removed, so reading again gives the same monitor.
+		assert_eq!(stored_state(&monitor_name), (stored_update_id, vec![update_ids[0]]));
+		let persisted_chan_data = persister.read_all_channel_monitors_with_updates().unwrap();
+		assert_eq!(persisted_chan_data[0].1.get_latest_update_id(), update_ids[0]);
 	}
 
 	fn persist_fn<P: Deref, ChannelSigner: EcdsaChannelSigner>(_persist: P) -> bool
