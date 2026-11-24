@@ -3307,7 +3307,12 @@ const MAX_PEER_STORAGE_SIZE: usize = 1024;
 
 /// The maximum number of peers which we do not have a (funded) channel with. Once we reach this
 /// many peers we reject new (inbound) connections.
-const MAX_NO_CHANNEL_PEERS: usize = 250;
+///
+/// ZEUS: 1,000 rather than upstream's 250. A node selling channels (zln's LSP service) must take
+/// connections from new buyers, who have no channel yet, and 250 idle connections from a few
+/// dozen networks would lock them all out. zln caps such peers per network at accept time, so this
+/// bound is what an attacker needs that many networks to fill. Each such peer costs a few KB.
+const MAX_NO_CHANNEL_PEERS: usize = 1000;
 
 /// Used by [`ChannelManager::list_recent_payments`] to express the status of recent payments.
 /// These include payments that have yet to find a successful path, or have unresolved HTLCs.
